@@ -1,0 +1,31 @@
+[Unit]
+Description=V2b MTX Auto-Trading (Paper)
+Documentation=https://github.com/kira/trading-agents
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kira
+Group=kira
+WorkingDirectory=/Users/kira/trading-agents
+ExecStart=/Users/kira/trading-agents/.venv/bin/python -m src.scheduler.main
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/Users/kira/trading-agents/.env
+
+# Logging — output goes to journald; use `journalctl -u trading-agents-v2` to view
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-agents-v2
+
+[Install]
+WantedBy=multi-user.target

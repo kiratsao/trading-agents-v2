@@ -1,0 +1,32 @@
+# V2b Paper Trading 帳戶設定
+#
+# 帳戶名稱: aggressive
+# 策略: V2b EMA(30/100) CD3 ATR×2.0
+# 商品: MXF (小台指)
+# 初始資金: 350,000 NTD
+
+accounts:
+  aggressive:
+    equity: 350000
+    contracts: 2
+
+    strategy_params:
+      ema_fast: 30
+      ema_slow: 100
+      atr_stop_mult: 2.0
+      confirm_days: 3
+
+    scale_ladder:
+      - equity: 350000
+        contracts: 2
+      - equity: 480000
+        contracts: 3
+      - equity: 600000
+        contracts: 4
+
+    sessions:
+      day:
+        execution_timing: "night_open"
+        decision_time: "14:30"
+        execution_time: "15:05"
+        enable_tsmc_signal: false
