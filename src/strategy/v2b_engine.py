@@ -203,8 +203,9 @@ class V2bEngine:
 
         # ── In position: check exits ────────────────────────────────
         if current_position > 0 and entry_price is not None:
-            hh = highest_high if highest_high is not None else close
-            hh = max(hh, close)
+            today_high = float(data["high"].iloc[-1])
+            hh = highest_high if highest_high is not None else today_high
+            hh = max(hh, today_high)
 
             # Trailing / chandelier stop
             if self.exit_mode == "chandelier":
@@ -245,8 +246,8 @@ class V2bEngine:
                     f"death cross: EMA{self.ema_fast}={ema_f:.0f} < EMA{self.ema_slow}={ema_s:.0f}",
                 )
 
-            # Pyramid scale-in
-            float_profit = (close - entry_price) * (contracts or current_position)
+            # Pyramid scale-in (per-contract profit in points, not total)
+            float_profit = close - entry_price
             add_threshold = self.pyramid_atr_mult * atr_v
             if float_profit >= add_threshold:
                 import math as _math

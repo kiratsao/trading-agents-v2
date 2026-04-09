@@ -187,9 +187,12 @@ class BacktestEngine:
                 margin_required = n * MTX_MARGIN
                 if margin_required > realized_equity:
                     logger.warning(
-                        "⚠️ margin exceeded: %d口需要 %,.0f 但 equity=%,.0f  [%s]",
+                        "⚠️ margin exceeded: %d口需要 %,.0f 但 equity=%,.0f — skipping [%s]",
                         n, margin_required, realized_equity, today.date(),
                     )
+                    # Record MTM equity and continue — do not open position
+                    equity_points.append((today, realized_equity))
+                    continue
                 realized_equity -= COST_PER_SIDE * n
                 position = n
                 entry_price = exec_price
@@ -209,9 +212,16 @@ class BacktestEngine:
                 margin_required = total * MTX_MARGIN
                 if margin_required > realized_equity:
                     logger.warning(
-                        "⚠️ margin exceeded: %d口需要 %,.0f 但 equity=%,.0f  [%s]",
+                        "⚠️ pyramid margin exceeded: %d口需要 %,.0f 但 equity=%,.0f — skipping [%s]",
                         total, margin_required, realized_equity, today.date(),
                     )
+                    # Skip pyramid, just update trailing high and MTM
+                    today_high = float(row["high"])
+                    if highest_high is None or today_high > highest_high:
+                        highest_high = today_high
+                    unrealized = (close - entry_price) * position * TICK_VALUE
+                    equity_points.append((today, realized_equity + unrealized))
+                    continue
                 entry_price = (entry_price * position + exec_price * add_n) / total
                 realized_equity -= COST_PER_SIDE * add_n
                 position = total
@@ -221,10 +231,11 @@ class BacktestEngine:
                     today.date(), exec_price, add_n, total, realized_equity,
                 )
 
-            # ── Update trailing high ───────────────────────────────
+            # ── Update trailing high (use intraday high, not close) ──
             if position > 0:
-                if highest_high is None or close > highest_high:
-                    highest_high = close
+                today_high = float(row["high"])
+                if highest_high is None or today_high > highest_high:
+                    highest_high = today_high
 
             # ── Mark-to-market equity (key fix: includes unrealized PnL) ──
             if position > 0 and entry_price is not None:

@@ -298,6 +298,161 @@ def _get_latest_price(orchestrator, live: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Night guard runner
+# ---------------------------------------------------------------------------
+
+
+def _run_night_guard(orchestrator, broker, notify_fn) -> None:
+    """Run NightGuard risk check at 05:15 and close position if triggered."""
+    from src.risk.night_guard import NightGuard, NightSession
+
+    state = orchestrator.state_mgr.load()
+    if state.position <= 0 or state.entry_price is None:
+        logger.debug("night_guard: no open position — skipping")
+        return
+
+    # Get night session OHLCV from Shioaji (or skip if unavailable)
+    try:
+        night_bar = _get_night_session_bar(orchestrator)
+    except Exception as exc:
+        logger.warning("night_guard: failed to get night session data: %s", exc)
+        return
+
+    if night_bar is None:
+        logger.info("night_guard: no night session data available — skipping")
+        return
+
+    # Compute ATR from latest daily data
+    try:
+        df = orchestrator._load_data()
+        ind = orchestrator.strategy._compute_indicators(df)
+        atr_val = float(ind["atr"].iloc[-1])
+    except Exception as exc:
+        logger.warning("night_guard: failed to compute ATR: %s", exc)
+        return
+
+    session = NightSession(
+        open_price=night_bar["open"],
+        high=night_bar["high"],
+        low=night_bar["low"],
+        close=night_bar["close"],
+    )
+
+    guard = NightGuard(guard1_atr_mult=2.0, guard2_atr_mult=2.0, guard3_pct=None)
+    result = guard.check(
+        position=state.position,
+        entry_price=state.entry_price,
+        atr=atr_val,
+        session=session,
+    )
+
+    if result.should_close:
+        logger.warning("night_guard TRIGGERED: %s", result.reason)
+        COST_PER_SIDE = 160.0
+        TICK_VALUE = 50.0
+        closed_n = state.position
+
+        if broker is not None:
+            try:
+                order = broker.place_order("MXF", "Sell", closed_n)
+                exec_price = order.get("fill_price", session.close)
+            except Exception as exc:
+                logger.error("night_guard: close order failed: %s", exc)
+                notify_fn(f"⚠️ 夜盤風控觸發但平倉失敗: {result.reason}\n錯誤: {exc}")
+                return
+        else:
+            exec_price = session.close
+
+        pnl_pts = exec_price - (state.entry_price or 0.0)
+        pnl_twd = pnl_pts * closed_n * TICK_VALUE - COST_PER_SIDE * 2 * closed_n
+        state.equity += pnl_twd
+        state.position = 0
+        state.entry_price = None
+        state.contracts = 0
+        state.highest_high = None
+        state.pyramided = False
+        state.pending_action = None
+        state.pending_contracts = 0
+        orchestrator.state_mgr.save(state)
+
+        msg = (
+            f"🚨 夜盤風控平倉\n"
+            f"━━━━━━━━━━━━\n"
+            f"原因: {result.reason}\n"
+            f"平倉: {closed_n}×MXF @ {exec_price:.0f}\n"
+            f"損益: {pnl_twd:+,.0f} NTD\n"
+            f"淨值: {state.equity:,.0f} NTD\n"
+            f"━━━━━━━━━━━━"
+        )
+        notify_fn(msg)
+        logger.info("night_guard: position closed. pnl=%+.0f equity=%.0f", pnl_twd, state.equity)
+    else:
+        logger.info("night_guard: all clear — position safe")
+
+
+def _get_night_session_bar(orchestrator) -> dict | None:
+    """Try to get night session OHLCV (15:00-05:00) from Shioaji."""
+    if not orchestrator.live:
+        return None
+
+    try:
+        import os
+        from datetime import date, time
+
+        import pandas as pd
+
+        api_key = os.environ.get("SHIOAJI_API_KEY", "")
+        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
+        if not api_key or not secret_key:
+            return None
+
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+
+        adapter = ShioajiAdapter(
+            api_key=api_key, secret_key=secret_key, simulation=False,
+        )
+        contract = adapter.get_contract("MXF")
+        today = date.today()
+        yesterday = today - pd.Timedelta(days=1)
+
+        kbars = adapter._api.kbars(
+            contract, start=str(yesterday), end=str(today), timeout=15_000,
+        )
+        adapter.logout()
+
+        if not kbars or len(kbars.ts) == 0:
+            return None
+
+        df = pd.DataFrame({
+            "ts": kbars.ts, "open": kbars.Open, "high": kbars.High,
+            "low": kbars.Low, "close": kbars.Close, "volume": kbars.Volume,
+        })
+        df["ts"] = pd.to_datetime(df["ts"], unit="ns", utc=True).dt.tz_convert("Asia/Taipei")
+
+        # Night session: 15:00 yesterday to 05:00 today
+        night_start = time(15, 0)
+        night_end = time(5, 0)
+        night_mask = (
+            ((df["ts"].dt.date == yesterday.date()) & (df["ts"].dt.time >= night_start))
+            | ((df["ts"].dt.date == today) & (df["ts"].dt.time <= night_end))
+        )
+        night_df = df[night_mask]
+
+        if night_df.empty:
+            return None
+
+        return {
+            "open": float(night_df.iloc[0]["open"]),
+            "high": float(night_df["high"].max()),
+            "low": float(night_df["low"].min()),
+            "close": float(night_df.iloc[-1]["close"]),
+        }
+    except Exception as exc:
+        logger.debug("_get_night_session_bar failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -372,8 +527,16 @@ def main(argv=None) -> None:
             id="v2b_execution",
             name="V2b 15:05 夜盤下單",
         )
+        # Phase 3: 05:15 night guard risk check
+        scheduler.add_job(
+            func=lambda: _run_night_guard(orchestrator, broker, notify_fn),
+            trigger=CronTrigger(day_of_week="tue-sat", hour=5, minute=15),
+            id="v2b_night_guard",
+            name="V2b 05:15 夜盤風控",
+        )
         logger.info(
-            "Scheduler registered: mon-fri 14:30 (signal) + 15:05 (night execution) Asia/Taipei"
+            "Scheduler registered: mon-fri 14:30 (signal) + 15:05 (execution) "
+            "+ tue-sat 05:15 (night guard) Asia/Taipei"
         )
     else:
         scheduler.add_job(

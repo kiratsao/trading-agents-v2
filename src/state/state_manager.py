@@ -84,7 +84,9 @@ class StateManager:
                 pass
         trades.append(trade)
         payload = {"state": state_dict, "trades": trades}
+        tmp = self.path.with_suffix(".json.tmp")
         try:
-            self.path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            tmp.replace(self.path)
         except OSError as exc:
             logger.error("StateManager.append_trade failed: %s", exc)

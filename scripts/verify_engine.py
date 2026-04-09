@@ -201,8 +201,10 @@ def run_backtest(
             if margin_required > realized_equity:
                 print(
                     f"  ⚠️ margin exceeded: {n}口需要 {margin_required:,.0f} "
-                    f"但 equity={realized_equity:,.0f}  [{today.date()}]"
+                    f"但 equity={realized_equity:,.0f} — skipping [{today.date()}]"
                 )
+                equity_points.append((today, realized_equity))
+                continue
             realized_equity -= COST_PER_SIDE * n  # entry commission
             position = n
             entry_price = exec_price
@@ -233,10 +235,11 @@ def run_backtest(
             position = total
             pyramided = True
 
-        # ── Update trailing high ────────────────────────────────────
+        # ── Update trailing high (use intraday high, not close) ─────
         if position > 0:
-            if highest_high is None or close > highest_high:
-                highest_high = close
+            today_high = float(row["high"])
+            if highest_high is None or today_high > highest_high:
+                highest_high = today_high
 
         # ── Mark-to-market equity for curve ────────────────────────
         if position > 0 and entry_price is not None:

@@ -160,11 +160,36 @@ class V2bOrchestrator:
             state.highest_high = None
             state.pyramided = False
 
+        elif sig.action == "add" and state.position > 0:
+            add_n = sig.contracts if sig.contracts > 0 else 1
+            total = state.position + add_n
+            margin_required = total * 119_250.0
+            if margin_required > state.equity:
+                logger.warning(
+                    "pyramid margin exceeded: %d口需要 %,.0f 但 equity=%,.0f — skipping",
+                    total, margin_required, state.equity,
+                )
+            else:
+                if broker is not None:
+                    order = broker.place_order("MXF", "Buy", add_n)
+                    result["order_id"] = order.get("order_id")
+                    exec_price = order.get("fill_price", float(df["close"].iloc[-1]))
+                else:
+                    exec_price = float(df["close"].iloc[-1])
+                old_entry = state.entry_price or exec_price
+                state.entry_price = (old_entry * state.position + exec_price * add_n) / total
+                state.equity -= COST_PER_SIDE * add_n
+                state.position = total
+                state.contracts = total
+                state.pyramided = True
+                result["add_contracts"] = add_n
+                _action_contracts = add_n
+
         elif sig.action == "hold" and state.position > 0:
             # Update trailing stop / highest_high
-            curr_close = float(df["close"].iloc[-1])
-            if state.highest_high is None or curr_close > state.highest_high:
-                state.highest_high = curr_close
+            curr_high = float(df["high"].iloc[-1])
+            if state.highest_high is None or curr_high > state.highest_high:
+                state.highest_high = curr_high
 
         self.state_mgr.save(state)
 
@@ -338,6 +363,27 @@ class V2bOrchestrator:
             state.contracts = 0
             state.highest_high = None
             state.pyramided = False
+
+        elif state.pending_action == "add" and state.position > 0:
+            add_n = state.pending_contracts if state.pending_contracts > 0 else 1
+            total = state.position + add_n
+            margin_required = total * 119_250.0
+            if margin_required > state.equity:
+                logger.warning(
+                    "run_execution: pyramid margin exceeded — skipping add"
+                )
+            else:
+                if broker is not None:
+                    order = broker.place_order("MXF", "Buy", add_n)
+                    result["order_id"] = order.get("order_id")
+                    exec_price = order.get("fill_price", exec_price)
+                old_entry = state.entry_price or exec_price
+                state.entry_price = (old_entry * state.position + exec_price * add_n) / total
+                state.equity -= COST_PER_SIDE * add_n
+                state.position = total
+                state.contracts = total
+                state.pyramided = True
+                result["add_contracts"] = add_n
 
         # Clear pending
         state.pending_action = None
