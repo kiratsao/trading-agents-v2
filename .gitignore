@@ -1,0 +1,77 @@
+# ── Environment & secrets ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+secrets/
+
+# ── Python generated files ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.Python
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# ── Virtual environment ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Database & runtime state ───────────────────────────────────────────────────
+data/db/*.db
+data/db/*.db-shm
+data/db/*.db-wal
+data/paper_state.json
+data/drawdown_state.json
+data/equity_history.json
+data/execution_log.json
+data/tw_execution_log.json
+data/reports/
+data/synthetic/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/*
+!logs/.gitkeep
+*.log
+shioaji.log
+
+# ── Data files (never track — managed by daily_updater / init_data.py) ───────
+*.parquet
+*.pkl
+*.csv
+*.feather
+
+# ── Results / charts ──────────────────────────────────────────────────────────
+results/
+
+# ── Archives ──────────────────────────────────────────────────────────────────
+*.tar.gz
+*.zip
+
+# ── OS & editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
