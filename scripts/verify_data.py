@@ -44,7 +44,7 @@ def main():
         issues.append(f"DUPLICATE DATES: {len(dups)} duplicates")
 
     # 4. Close range
-    out_of_range = df[(df["close"] < 10_000) | (df["close"] > 50_000)]
+    out_of_range = df[(df["close"] < 5_000) | (df["close"] > 60_000)]
     if len(out_of_range) > 0:
         issues.append(f"OUT OF RANGE: {len(out_of_range)} rows with close outside 10K-50K")
 

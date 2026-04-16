@@ -45,15 +45,19 @@ def update(
     parquet_path = parquet_path or _PRIMARY_PARQUET
     _notify = notify_fn or (lambda msg: None)
 
-    # 1. Load existing parquet
+    # 1. Load existing parquet — ensure DatetimeIndex
     if parquet_path.exists():
         df = pd.read_parquet(parquet_path)
+        df.index = pd.to_datetime(df.index)
         if hasattr(df.index, "tz") and df.index.tz is not None:
             df.index = df.index.tz_localize(None)
         df = df.sort_index()
         last_date = df.index[-1].date() if len(df) > 0 else date(2020, 1, 1)
     else:
-        df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume"],
+            index=pd.DatetimeIndex([], name="date"),
+        )
         last_date = date(2020, 1, 1)
 
     # 2. Determine fetch range
@@ -90,6 +94,8 @@ def update(
 
     # 6. Append and save
     df = pd.concat([df, new_bars]).sort_index()
+    df.index = pd.to_datetime(df.index)
+    df.index.name = "date"
     df.to_parquet(parquet_path, index=True)
     n_new = len(new_bars)
     new_last = df.index[-1].date()

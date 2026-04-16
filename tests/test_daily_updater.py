@@ -116,6 +116,45 @@ class TestDailyUpdater:
 
         assert result["success"] is True
 
+    def test_concat_preserves_datetime_index(self, tmp_path):
+        """After append, parquet index is DatetimeIndex (not RangeIndex)."""
+        pq = tmp_path / "test.parquet"
+        _make_existing_parquet(pq, "2026-04-07")
+
+        with (
+            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)),
+            patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
+        ):
+            new_bar = pd.DataFrame(
+                {"open": [33300.0], "high": [33500.0], "low": [33250.0],
+                 "close": [33450.0], "volume": [120000]},
+                index=pd.DatetimeIndex([pd.Timestamp("2026-04-08")], name="date"),
+            )
+            mock_fetch.return_value = new_bar
+            update(parquet_path=pq)
+
+        # Reload and verify index type
+        df = pd.read_parquet(pq)
+        assert isinstance(df.index, pd.DatetimeIndex), (
+            f"Expected DatetimeIndex, got {type(df.index)}"
+        )
+
+        # Second update should not crash on .normalize()
+        with (
+            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 9)),
+            patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch2,
+        ):
+            bar2 = pd.DataFrame(
+                {"open": [33500.0], "high": [33600.0], "low": [33400.0],
+                 "close": [33550.0], "volume": [100000]},
+                index=pd.DatetimeIndex([pd.Timestamp("2026-04-09")], name="date"),
+            )
+            mock_fetch2.return_value = bar2
+            result = update(parquet_path=pq)
+
+        assert result["success"] is True
+        assert result["bars_added"] == 1
+
     def test_fetch_failure_notifies(self, tmp_path):
         """Failure → success=False, error set, notify_fn called with 🔴."""
         pq = tmp_path / "test.parquet"
