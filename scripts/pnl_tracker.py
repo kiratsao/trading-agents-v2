@@ -44,16 +44,55 @@ def load_investors() -> list[dict] | None:
         return None
 
 
-def get_equity() -> float:
-    """Get current equity from state file."""
-    import json
-    if not _STATE_JSON.exists():
-        return 0.0
+def get_equity() -> tuple[float, str]:
+    """Get current equity: Shioaji live first, state file fallback.
+
+    Returns (equity, source) where source is "即時" or "估算".
+    """
+    # 1. Try Shioaji live equity
     try:
-        raw = json.loads(_STATE_JSON.read_text(encoding="utf-8"))
-        return float(raw.get("state", {}).get("equity", 0))
-    except Exception:
-        return 0.0
+        import os
+
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
+        api_key = os.environ.get("SHIOAJI_API_KEY", "")
+        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
+        if api_key and secret_key:
+            from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+            adapter = ShioajiAdapter(
+                api_key=api_key,
+                secret_key=secret_key,
+                simulation=False,
+                cert_path=os.environ.get("SHIOAJI_CERT_PATH") or None,
+                cert_password=os.environ.get("SHIOAJI_CERT_PASSWORD") or None,
+                person_id=os.environ.get("SHIOAJI_PERSON_ID") or None,
+            )
+            try:
+                acct = adapter.get_account()
+                eq = float(acct.get("equity", 0))
+                if eq > 0:
+                    return eq, "即時"
+            finally:
+                adapter.logout()
+    except Exception as exc:
+        logger.debug("pnl_tracker: Shioaji equity failed: %s", exc)
+
+    # 2. Fallback to state file
+    import json
+    if _STATE_JSON.exists():
+        try:
+            raw = json.loads(_STATE_JSON.read_text(encoding="utf-8"))
+            eq = float(raw.get("state", {}).get("equity", 0))
+            if eq > 0:
+                return eq, "估算"
+        except Exception:
+            pass
+
+    return 0.0, "估算"
 
 
 def track_pnl() -> dict | None:
@@ -65,7 +104,7 @@ def track_pnl() -> dict | None:
     if not investors:
         return None
 
-    equity = get_equity()
+    equity, equity_src = get_equity()
     total_capital = sum(inv["capital"] for inv in investors)
 
     if total_capital <= 0:
@@ -77,6 +116,7 @@ def track_pnl() -> dict | None:
     result = {
         "date": today_str,
         "total_equity": equity,
+        "equity_source": equity_src,
         "total_capital": total_capital,
         "total_pnl": total_pnl,
         "investors": [],
@@ -121,7 +161,9 @@ def track_pnl() -> dict | None:
 
 def format_pnl_line(result: dict) -> str:
     """Format PnL split for LINE notification."""
-    lines = ["📊 損益分帳"]
+    src = result.get("equity_source", "估算")
+    eq = result["total_equity"]
+    lines = [f"📊 損益分帳 (淨值: {eq:,.0f} {src})"]
     for inv in result["investors"]:
         pct = inv["share"] * 100
         icon = "📈" if inv["pnl"] >= 0 else "📉"
