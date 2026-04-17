@@ -759,9 +759,10 @@ def _fetch_today_bar_shioaji(simulation: bool = True) -> dict | None:
         # Sort by timestamp to ensure first/last are chronologically correct
         df = df.sort_values("ts")
 
-        # Keep only day-session bars: 08:45–13:44 (< 13:45 excludes settlement bar)
+        # Day session: 08:45-13:44 normal, 08:45-13:29 settlement day
+        from src.strategy.v2b_engine import _is_settlement_day
         day_open = time(8, 45)
-        day_close = time(13, 45)
+        day_close = time(13, 30) if _is_settlement_day(pd.Timestamp(today)) else time(13, 45)
         today_mask = (
             (df["ts"].dt.date == today)
             & (df["ts"].dt.time >= day_open)

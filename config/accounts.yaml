@@ -3,12 +3,12 @@
 # 帳戶名稱: aggressive
 # 策略: V2b EMA(30/100) CD2 ATR×2.0 ADX>25
 # 商品: MXF (小台指)
-# 初始資金: 350,000 NTD
+# 初始資金: 880,000 NTD
 
 accounts:
   aggressive:
-    equity: 350000
-    contracts: 2
+    equity: 880000
+    contracts: 6
 
     strategy_params:
       ema_fast: 30
@@ -24,6 +24,14 @@ accounts:
         contracts: 3
       - equity: 600000
         contracts: 4
+      - equity: 720000
+        contracts: 5
+      - equity: 840000
+        contracts: 6
+      - equity: 960000
+        contracts: 7
+
+    margin_per_contract: 119250
 
     sessions:
       day:

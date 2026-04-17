@@ -90,14 +90,51 @@ def main():
     else:
         logger.info("State file not found (new deployment?)")
 
-    # 3. Report
+    # 3. Build status lines
+    if _DATA.exists():
+        df = pd.read_parquet(_DATA)
+        df.index = pd.to_datetime(df.index)
+        bars = len(df)
+        latest = df.index[-1].date()
+    else:
+        bars = 0
+        latest = "N/A"
+
+    state_line = "空倉"
+    eq_line = "N/A"
+    if _STATE.exists():
+        try:
+            raw = json.loads(_STATE.read_text())
+            s = raw.get("state", {})
+            pos = s.get("position", 0)
+            eq = float(s.get("equity", 0))
+            entry = s.get("entry_price")
+            eq_line = f"{eq:,.0f}"
+            if pos > 0 and entry:
+                state_line = f"{pos}口 @ {entry:,.0f}"
+            elif pos > 0:
+                state_line = f"{pos}口"
+        except Exception:
+            pass
+
+    # 4. Report — always notify
     if issues:
-        msg = "🔴 Daily Health Check 異常:\n" + "\n".join(f"• {i}" for i in issues)
+        msg = (
+            "🔴 每日健康檢查異常\n"
+            + "\n".join(f"• {i}" for i in issues)
+        )
         logger.error(msg)
         _send_line(msg)
         sys.exit(1)
     else:
-        logger.info("✅ Daily health check passed")
+        msg = (
+            f"✅ 每日健康檢查通過\n"
+            f"資料: {bars} bars ({latest})\n"
+            f"持倉: {state_line}\n"
+            f"淨值: {eq_line}"
+        )
+        logger.info(msg)
+        _send_line(msg)
 
 
 if __name__ == "__main__":

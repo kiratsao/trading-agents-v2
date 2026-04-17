@@ -30,6 +30,7 @@ _PRIMARY_PARQUET = _DATA_DIR / "MXF_Daily_Clean_2020_to_now.parquet"
 
 _DAY_OPEN = time(8, 45)
 _DAY_CLOSE = time(13, 45)
+_SETTLE_CLOSE = time(13, 30)  # settlement day regular session ends 13:30
 
 
 def update(
@@ -159,8 +160,18 @@ def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
     raw["ts"] = pd.to_datetime(raw["ts"], unit="ns", utc=True).dt.tz_convert("Asia/Taipei")
     raw = raw.sort_values("ts")
 
-    # Day session only: 08:45-13:44 (< 13:45 excludes settlement bar)
-    mask = (raw["ts"].dt.time >= _DAY_OPEN) & (raw["ts"].dt.time < _DAY_CLOSE)
+    # Day session filter — settlement day ends at 13:30, normal at 13:45
+    from src.strategy.v2b_engine import _is_settlement_day
+
+    def _day_session_mask(row_ts):
+        t = row_ts.time()
+        if t < _DAY_OPEN:
+            return False
+        if _is_settlement_day(pd.Timestamp(row_ts.date())):
+            return t < _SETTLE_CLOSE
+        return t < _DAY_CLOSE
+
+    mask = raw["ts"].apply(_day_session_mask)
     day = raw[mask].copy()
 
     if day.empty:
