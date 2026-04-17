@@ -48,6 +48,10 @@ logs/*
 *.log
 shioaji.log
 
+# ── Local-only config (investor PnL tracking) ───────────────────────────────
+config/investors.yaml
+data/pnl_history.csv
+
 # ── Data files (never track — managed by daily_updater / init_data.py) ───────
 *.parquet
 *.pkl

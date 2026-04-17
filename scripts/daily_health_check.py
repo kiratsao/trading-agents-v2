@@ -117,7 +117,17 @@ def main():
         except Exception:
             pass
 
-    # 4. Report — always notify
+    # 4. PnL tracking (optional — only if investors.yaml exists)
+    pnl_line = ""
+    try:
+        from scripts.pnl_tracker import format_pnl_line, track_pnl
+        pnl_result = track_pnl()
+        if pnl_result:
+            pnl_line = "\n" + format_pnl_line(pnl_result)
+    except Exception as exc:
+        logger.debug("pnl_tracker skipped: %s", exc)
+
+    # 5. Report — always notify
     if issues:
         msg = (
             "🔴 每日健康檢查異常\n"
@@ -132,6 +142,7 @@ def main():
             f"資料: {bars} bars ({latest})\n"
             f"持倉: {state_line}\n"
             f"淨值: {eq_line}"
+            f"{pnl_line}"
         )
         logger.info(msg)
         _send_line(msg)
