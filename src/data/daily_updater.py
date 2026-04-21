@@ -79,7 +79,13 @@ def update(
         return {"success": False, "bars_added": 0, "latest_date": str(last_date), "error": err}
 
     if new_bars is None or new_bars.empty:
-        logger.info("daily_updater: no new bars from Shioaji")
+        # Warn if today is a weekday (trading day) but got zero bars
+        if today.weekday() < 5:
+            warn = f"⚠️ 資料更新: 交易日({today})但新增 0 bars"
+            logger.warning(warn)
+            _notify(warn)
+        else:
+            logger.info("daily_updater: no new bars (weekend)")
         return {"success": True, "bars_added": 0, "latest_date": str(last_date), "error": None}
 
     # 4. Filter weekends
@@ -160,19 +166,20 @@ def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
     raw["ts"] = pd.to_datetime(raw["ts"], unit="ns", utc=True).dt.tz_convert("Asia/Taipei")
     raw = raw.sort_values("ts")
 
-    # Day session filter — settlement day ends at 13:30, normal at 13:45
+    # Day session filter: 08:45 <= t < 13:45 (normal) or < 13:30 (settlement)
+    # Vectorised: filter by time, then remove settlement-day bars >= 13:30
     from src.strategy.v2b_engine import _is_settlement_day
 
-    def _day_session_mask(row_ts):
-        t = row_ts.time()
-        if t < _DAY_OPEN:
-            return False
-        if _is_settlement_day(pd.Timestamp(row_ts.date())):
-            return t < _SETTLE_CLOSE
-        return t < _DAY_CLOSE
-
-    mask = raw["ts"].apply(_day_session_mask)
+    t = raw["ts"].dt.time
+    mask = (t >= _DAY_OPEN) & (t < _DAY_CLOSE)
     day = raw[mask].copy()
+
+    # Remove 13:30-13:44 bars on settlement days
+    if not day.empty:
+        day_dates = day["ts"].dt.normalize()
+        is_settle = day_dates.apply(lambda d: _is_settlement_day(d))
+        settle_late = is_settle & (day["ts"].dt.time >= _SETTLE_CLOSE)
+        day = day[~settle_late]
 
     if day.empty:
         return None

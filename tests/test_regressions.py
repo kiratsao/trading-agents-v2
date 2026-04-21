@@ -136,6 +136,52 @@ class TestRegressionDailyUpdaterFailureAlertsLine:
         assert "🔴" in notify.call_args[0][0]
 
 
+class TestRegressionZeroBarsOnTradingDayWarns:
+    """Bug: bars_added=0 on a trading day reported success silently."""
+
+    def test_zero_bars_weekday_warns(self, tmp_path):
+        pq = tmp_path / "test.parquet"
+        # Last bar is Friday 04/17 → fetch_start=04/18, today=04/20 (Mon)
+        dates = pd.bdate_range("2026-04-15", periods=3)  # Wed/Thu/Fri
+        df = pd.DataFrame(
+            {"open": [1.0]*3, "high": [2.0]*3, "low": [0.5]*3,
+             "close": [1.5]*3, "volume": [100]*3},
+            index=dates,
+        )
+        df.index.name = "date"
+        df.to_parquet(pq)
+        notify = MagicMock()
+
+        # Monday 04/20: fetch returns empty → should warn
+        with (
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=pd.Timestamp("2026-04-20").date()),
+            patch("src.data.daily_updater._fetch_and_aggregate",
+                  return_value=None),
+        ):
+            result = update(parquet_path=pq, notify_fn=notify)
+
+        assert result["bars_added"] == 0
+        notify.assert_called_once()
+        assert "⚠️" in notify.call_args[0][0]
+
+
+class TestRegressionFreshBrokerPerJob:
+    """Bug: daemon reused stale broker → token expired after days."""
+
+    def test_main_jobs_dont_capture_broker(self):
+        """Verify scheduler jobs create fresh brokers, not a captured one."""
+        src = Path("src/scheduler/main.py").read_text()
+        # The old pattern: lambda: orchestrator.run_signal(broker=broker)
+        # captures broker from outer scope. New pattern uses _run_signal etc.
+        assert "lambda: orchestrator.run_signal(broker=broker)" not in src
+        assert "lambda: orchestrator.run_execution(broker=broker)" not in src
+        assert "lambda: orchestrator.run_daily(broker=broker)" not in src
+        # New pattern should have _run_signal / _run_execution / _run_daily
+        assert "_run_signal" in src
+        assert "_run_execution" in src
+
+
 class TestRegressionParquetNotInGit:
     """Bug: parquet tracked by git → git pull overwrites daily updates."""
 

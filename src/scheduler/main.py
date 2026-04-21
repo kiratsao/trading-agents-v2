@@ -376,36 +376,44 @@ def main(argv=None) -> None:
     )
 
     cfg = _load_config(args.config)
-    orchestrator = _build_orchestrator(cfg, live=args.live)
-    broker = _build_broker(args.live)
+    is_live = args.live
+    orchestrator = _build_orchestrator(cfg, live=is_live)
     notify_fn = orchestrator.notify_fn
 
     # ── Startup notification ──────────────────────────────────────────
-    _send_startup_notification(orchestrator, notify_fn, mode, broker=broker)
+    startup_broker = _build_broker(is_live)
+    _send_startup_notification(orchestrator, notify_fn, mode, broker=startup_broker)
+    if startup_broker:
+        startup_broker.logout()
 
     # ── Run-once mode ─────────────────────────────────────────────────
     if run_once:
-        if orchestrator.execution_timing == "night_open":
-            logger.info("── run-once night_open: Phase 1 (signal) ──")
-            sig_result = orchestrator.run_signal(broker=broker)
-            logger.info("run_signal result: %s", sig_result)
-            print("\n  [14:30 signal]")
-            print(f"  action   : {sig_result.get('action')}")
-            print(f"  contracts: {sig_result.get('contracts', 0)}")
-            print(f"  reason   : {sig_result.get('reason')}")
+        broker = _build_broker(is_live)
+        try:
+            if orchestrator.execution_timing == "night_open":
+                logger.info("── run-once night_open: Phase 1 (signal) ──")
+                sig_result = orchestrator.run_signal(broker=broker)
+                logger.info("run_signal result: %s", sig_result)
+                print("\n  [14:30 signal]")
+                print(f"  action   : {sig_result.get('action')}")
+                print(f"  contracts: {sig_result.get('contracts', 0)}")
+                print(f"  reason   : {sig_result.get('reason')}")
 
-            logger.info("── run-once night_open: Phase 2 (execution) ──")
-            exec_result = orchestrator.run_execution(broker=broker)
-            logger.info("run_execution result: %s", exec_result)
-            print("\n  [15:05 execution]")
-            print(f"  action   : {exec_result.get('action')}")
-            if "pnl_twd" in exec_result:
-                print(f"  pnl_twd  : {exec_result['pnl_twd']:.0f} NTD")
-        else:
-            logger.info("── run-once mode: executing one daily cycle ──")
-            result = orchestrator.run_daily(broker=broker)
-            logger.info("run_daily result: %s", result)
-            print(f"\n  action   : {result.get('action')}")
+                logger.info("── run-once night_open: Phase 2 (execution) ──")
+                exec_result = orchestrator.run_execution(broker=broker)
+                logger.info("run_execution result: %s", exec_result)
+                print("\n  [15:05 execution]")
+                print(f"  action   : {exec_result.get('action')}")
+                if "pnl_twd" in exec_result:
+                    print(f"  pnl_twd  : {exec_result['pnl_twd']:.0f} NTD")
+            else:
+                logger.info("── run-once mode: executing one daily cycle ──")
+                result = orchestrator.run_daily(broker=broker)
+                logger.info("run_daily result: %s", result)
+                print(f"\n  action   : {result.get('action')}")
+        finally:
+            if broker:
+                broker.logout()
         return
 
     # ── Daemon mode (APScheduler) ─────────────────────────────────────
@@ -442,17 +450,40 @@ def main(argv=None) -> None:
         name="V2b 14:25 資料更新",
     )
 
+    # Each job creates a fresh broker to avoid token expiry
+    def _run_signal():
+        b = _build_broker(is_live)
+        try:
+            orchestrator.run_signal(broker=b)
+        finally:
+            if b:
+                b.logout()
+
+    def _run_execution():
+        b = _build_broker(is_live)
+        try:
+            orchestrator.run_execution(broker=b)
+        finally:
+            if b:
+                b.logout()
+
+    def _run_daily():
+        b = _build_broker(is_live)
+        try:
+            orchestrator.run_daily(broker=b)
+        finally:
+            if b:
+                b.logout()
+
     if orchestrator.execution_timing == "night_open":
-        # Phase 1: 14:30 signal (pass broker for live equity query)
         scheduler.add_job(
-            func=lambda: orchestrator.run_signal(broker=broker),
+            func=_run_signal,
             trigger=CronTrigger(day_of_week="mon-fri", hour=14, minute=30),
             id="v2b_signal",
             name="V2b 14:30 信號",
         )
-        # Phase 2: 15:05 execution
         scheduler.add_job(
-            func=lambda: orchestrator.run_execution(broker=broker),
+            func=_run_execution,
             trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=5),
             id="v2b_execution",
             name="V2b 15:05 夜盤下單",
@@ -463,7 +494,7 @@ def main(argv=None) -> None:
         )
     else:
         scheduler.add_job(
-            func=lambda: orchestrator.run_daily(broker=broker),
+            func=_run_daily,
             trigger=CronTrigger(day_of_week="mon-fri", hour=14, minute=30),
             id="v2b_daily",
             name="V2b 14:30 每日執行",
