@@ -84,6 +84,7 @@ def _build_orchestrator(cfg: dict, live: bool = False):
         confirm_days=params.get("confirm_days", 2),
         adx_threshold=params.get("adx_threshold", 25),
         ladder=ladder,
+        max_contracts=acc.get("max_contracts"),
     )
     state_mgr = StateManager(path="data/paper_state.json")
     notify_fn = _build_notifier()

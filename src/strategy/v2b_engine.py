@@ -43,13 +43,13 @@ _MTX_MARGIN: float = 119_250.0  # NTD original margin per MTX/MXF contract
 def _anti_martingale_contracts(
     equity: float,
     ladder: list[dict] | None = None,
+    max_contracts: int | None = None,
 ) -> int:
-    """Anti-martingale scale ladder with margin safety cap.
+    """Anti-martingale scale ladder with margin safety cap + hard ceiling.
 
     Default: 35萬→2口, 48萬→3口, 60萬→4口
 
-    Final contracts = min(ladder_contracts, floor(equity / MTX_MARGIN))
-    so that position never exceeds what the account margin can support.
+    Final contracts = min(ladder_contracts, margin_cap, max_contracts).
     """
     if not ladder:
         ladder = [
@@ -62,10 +62,16 @@ def _anti_martingale_contracts(
         if equity >= entry["equity"]:
             n = entry["contracts"]
 
-    # Margin safety cap: never exceed floor(equity / margin_per_contract)
+    # Margin safety cap
     import math
     max_by_margin = math.floor(equity / _MTX_MARGIN)
-    return min(n, max(1, max_by_margin))
+    n = min(n, max(1, max_by_margin))
+
+    # Hard ceiling from config
+    if max_contracts is not None and max_contracts > 0:
+        n = min(n, max_contracts)
+
+    return n
 
 
 def _third_wednesday(dt_date: date) -> date:
@@ -122,6 +128,7 @@ class V2bEngine:
         pyramid_size_fraction: float = 0.5,
         adx_threshold: float = 25.0,
         ladder: list[dict] | None = None,
+        max_contracts: int | None = None,
         exit_mode: str = "trailing",
         chandelier_lookback: int = 20,
         chandelier_mult: float = 3.0,
@@ -142,6 +149,7 @@ class V2bEngine:
         self.pyramid_size_fraction = pyramid_size_fraction
         self.adx_threshold = adx_threshold
         self.ladder = ladder
+        self.max_contracts = max_contracts
         self.exit_mode = exit_mode
         self.chandelier_lookback = chandelier_lookback
         self.chandelier_mult = chandelier_mult
@@ -199,7 +207,7 @@ class V2bEngine:
         if not (ema_f > 0 and ema_s > 0 and atr_v > 0):
             return Signal("hold", 0, "indicators not ready")
 
-        n_contracts = _anti_martingale_contracts(equity, self.ladder)
+        n_contracts = _anti_martingale_contracts(equity, self.ladder, self.max_contracts)
 
         # ── Settlement day force-close (only affects existing positions) ──
         if current_position > 0 and _is_settlement_day(cur_ts):
@@ -259,6 +267,9 @@ class V2bEngine:
                 # Margin safety cap: total position must not exceed floor(equity / margin)
                 cur_contracts = contracts or current_position
                 max_total = max(1, _math.floor(equity / _MTX_MARGIN))
+                # Hard ceiling from config
+                if self.max_contracts is not None and self.max_contracts > 0:
+                    max_total = min(max_total, self.max_contracts)
                 add_n = min(add_n, max(0, max_total - cur_contracts))
                 if add_n <= 0:
                     return Signal(

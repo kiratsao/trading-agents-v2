@@ -32,6 +32,7 @@ accounts:
         contracts: 7
 
     margin_per_contract: 119250
+    max_contracts: 8
 
     sessions:
       day:
