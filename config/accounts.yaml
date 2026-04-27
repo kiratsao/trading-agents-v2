@@ -31,8 +31,8 @@ accounts:
       - equity: 960000
         contracts: 7
 
-    margin_per_contract: 119250
-    max_contracts: 8
+    margin_per_contract: 131500   # TAIFEX 2026-04-27 調整
+    max_contracts: 11
 
     sessions:
       day:

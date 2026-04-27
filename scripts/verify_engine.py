@@ -55,7 +55,7 @@ from src.strategy.v2b_engine import V2bEngine  # noqa: E402
 TICK_VALUE: float = 50.0        # NTD per index point, MXF / MTX
 COST_PER_SIDE: float = 160.0    # NTD commission per side
 ROUND_TRIP: float = COST_PER_SIDE * 2
-MTX_MARGIN: float = 119_250.0   # NTD original margin per MTX/MXF contract
+MTX_MARGIN: float = 131_500.0   # NTD original margin per MTX/MXF contract (TAIFEX 2026-04-27)
 
 DATA_CANDIDATES = [
     ROOT / "data" / "TXF_Daily_Real.parquet",
