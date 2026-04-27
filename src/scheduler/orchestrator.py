@@ -246,6 +246,12 @@ class V2bOrchestrator:
             logger.error("No market data available.")
             return {"action": "error", "reason": "no data"}
 
+        # Data freshness guard: parquet must have at least yesterday's bar
+        freshness = self._check_data_freshness(df)
+        if freshness is not None:
+            self.notify_fn(freshness)
+            logger.warning("Data freshness check: %s", freshness)
+
         state = self.state_mgr.load()
         equity, equity_src = _query_live_equity(broker, state.equity)
         display_ind = self._compute_display_indicators(df, state)
@@ -487,6 +493,25 @@ class V2bOrchestrator:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _check_data_freshness(self, df: pd.DataFrame) -> str | None:
+        """Check that parquet data is reasonably fresh.
+
+        Returns a warning string if data is stale, None if OK.
+        Stale = latest bar date < 2 trading days ago (allows for holidays).
+        """
+        if df is None or df.empty:
+            return "🔴 資料防護: parquet 為空"
+        latest = df.index[-1].date()
+        today = pd.Timestamp.now(tz="Asia/Taipei").date()
+        # Count business days between latest and today
+        bdays = len(pd.bdate_range(latest, today, inclusive="neither"))
+        if bdays > 2:
+            return (
+                f"⚠️ 資料可能過期: parquet 最新={latest}, "
+                f"今天={today}, 差 {bdays} 個交易日"
+            )
+        return None
 
     def _compute_display_indicators(
         self,

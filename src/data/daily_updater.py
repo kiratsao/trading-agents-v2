@@ -1,15 +1,19 @@
 """每日自動更新 MXF 日K parquet。
 
-14:25 排程執行，確保 14:30 信號計算使用最新資料。
+14:25 排程執行，只更新到「昨天」(已收盤交易日)。
+今天的即時 bar 由 orchestrator._load_data 用 Shioaji snapshot 取得。
+
+這樣 14:25 永遠只處理已完成的交易日，不會有 partial bar 問題。
 
 流程
 ----
 1. 讀取現有 parquet 的最後日期
-2. 連線 Shioaji 抓取從最後日期+1 到今天的 1-min kbars
+2. 連線 Shioaji 抓取從最後日期+1 到昨天的 1-min kbars
 3. 聚合為日K（日盤 08:45-13:44）
 4. 過濾週末 bar
 5. 追加到 parquet（不重複）
-6. 成功/失敗都透過 notify_fn 通知
+6. 驗證 latest_date 是否為昨天(交易日)
+7. 成功/失敗都透過 notify_fn 通知
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ def update(
 ) -> dict:
     """Fetch new daily bars from Shioaji and append to parquet.
 
+    Only fetches bars up to *yesterday* (last completed trading day).
+    Today's bar is handled by orchestrator via Shioaji snapshot at signal time.
+
     Returns
     -------
     dict with keys: success, bars_added, latest_date, error.
@@ -61,43 +68,81 @@ def update(
         )
         last_date = date(2020, 1, 1)
 
-    # 2. Determine fetch range
+    # 2. Determine fetch range — only up to YESTERDAY (completed bars only)
     fetch_start = last_date + timedelta(days=1)
     today = _today_taipei()
-    if fetch_start > today:
-        logger.info("daily_updater: already up-to-date (last=%s)", last_date)
-        return {"success": True, "bars_added": 0, "latest_date": str(last_date), "error": None}
+    yesterday = _last_trading_day(today)
 
-    # 3. Fetch kbars from Shioaji
-    logger.info("daily_updater: fetching kbars %s → %s", fetch_start, today)
+    if fetch_start > yesterday:
+        logger.info("daily_updater: already up-to-date (last=%s)", last_date)
+        return {
+            "success": True,
+            "bars_added": 0,
+            "latest_date": str(last_date),
+            "error": None,
+        }
+
+    # 3. Fetch kbars from Shioaji (only up to yesterday)
+    logger.info(
+        "daily_updater: fetching kbars %s → %s (today=%s excluded)",
+        fetch_start, yesterday, today,
+    )
     try:
-        new_bars = _fetch_and_aggregate(fetch_start, today)
+        new_bars = _fetch_and_aggregate(fetch_start, yesterday)
     except Exception as exc:
         err = f"Shioaji fetch raised: {exc}"
         logger.error("🔴 資料更新失敗: %s", err)
         _notify(f"🔴 資料更新失敗: {err}")
-        return {"success": False, "bars_added": 0, "latest_date": str(last_date), "error": err}
+        return {
+            "success": False,
+            "bars_added": 0,
+            "latest_date": str(last_date),
+            "error": err,
+        }
 
     if new_bars is None or new_bars.empty:
-        # Warn if today is a weekday (trading day) but got zero bars
-        if today.weekday() < 5:
-            warn = f"⚠️ 資料更新: 交易日({today})但新增 0 bars"
-            logger.warning(warn)
+        # Validate: if latest_date < yesterday (trading day), this is a problem
+        if last_date < yesterday and yesterday.weekday() < 5:
+            warn = (
+                f"🔴 資料缺口: parquet 最新={last_date}, "
+                f"應至少到 {yesterday}, bars_added=0"
+            )
+            logger.error(warn)
             _notify(warn)
-        else:
-            logger.info("daily_updater: no new bars (weekend)")
-        return {"success": True, "bars_added": 0, "latest_date": str(last_date), "error": None}
+            return {
+                "success": False,
+                "bars_added": 0,
+                "latest_date": str(last_date),
+                "error": warn,
+            }
+        logger.info("daily_updater: no new bars (last=%s, yesterday=%s)", last_date, yesterday)
+        return {
+            "success": True,
+            "bars_added": 0,
+            "latest_date": str(last_date),
+            "error": None,
+        }
 
     # 4. Filter weekends
     new_bars = new_bars[new_bars.index.dayofweek < 5]
     if new_bars.empty:
-        return {"success": True, "bars_added": 0, "latest_date": str(last_date), "error": None}
+        return {
+            "success": True,
+            "bars_added": 0,
+            "latest_date": str(last_date),
+            "error": None,
+        }
 
     # 5. Remove duplicates
     existing_dates = set(df.index.normalize())
     new_bars = new_bars[~new_bars.index.normalize().isin(existing_dates)]
     if new_bars.empty:
-        return {"success": True, "bars_added": 0, "latest_date": str(last_date), "error": None}
+        return {
+            "success": True,
+            "bars_added": 0,
+            "latest_date": str(last_date),
+            "error": None,
+        }
 
     # 6. Append and save
     df = pd.concat([df, new_bars]).sort_index()
@@ -108,11 +153,40 @@ def update(
     new_last = df.index[-1].date()
     last_close = float(df["close"].iloc[-1])
 
-    msg = f"✅ 資料更新: +{n_new} bars, 最新: {new_last}, close: {last_close:,.0f}"
-    logger.info(msg)
-    _notify(msg)
+    # 7. Validate: latest_date should be >= yesterday
+    if new_last < yesterday and yesterday.weekday() < 5:
+        warn = (
+            f"⚠️ 資料更新: +{n_new} bars 但仍有缺口 "
+            f"(最新={new_last}, 應至少到 {yesterday})"
+        )
+        logger.warning(warn)
+        _notify(warn)
+    else:
+        msg = (
+            f"✅ 資料更新: +{n_new} bars, 最新: {new_last}, "
+            f"close: {last_close:,.0f}"
+        )
+        logger.info(msg)
+        _notify(msg)
 
-    return {"success": True, "bars_added": n_new, "latest_date": str(new_last), "error": None}
+    return {
+        "success": True,
+        "bars_added": n_new,
+        "latest_date": str(new_last),
+        "error": None,
+    }
+
+
+def _last_trading_day(ref: date) -> date:
+    """Return the most recent completed trading day before *ref*.
+
+    Skips weekends. Does not account for TAIFEX holidays — those will
+    simply return bars_added=0 with success=True (not a data gap).
+    """
+    d = ref - timedelta(days=1)
+    while d.weekday() >= 5:  # Saturday=5, Sunday=6
+        d -= timedelta(days=1)
+    return d
 
 
 def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
@@ -126,7 +200,9 @@ def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
     api_key = os.environ.get("SHIOAJI_API_KEY", "")
     secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
     if not api_key or not secret_key:
-        raise RuntimeError("SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY not set — check .env")
+        raise RuntimeError(
+            "SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY not set — check .env"
+        )
 
     from tw_futures.executor.shioaji_adapter import ShioajiAdapter
 
@@ -163,11 +239,12 @@ def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
         "close": kbars.Close,
         "volume": kbars.Volume,
     })
-    raw["ts"] = pd.to_datetime(raw["ts"], unit="ns", utc=True).dt.tz_convert("Asia/Taipei")
+    raw["ts"] = pd.to_datetime(
+        raw["ts"], unit="ns", utc=True,
+    ).dt.tz_convert("Asia/Taipei")
     raw = raw.sort_values("ts")
 
     # Day session filter: 08:45 <= t < 13:45 (normal) or < 13:30 (settlement)
-    # Vectorised: filter by time, then remove settlement-day bars >= 13:30
     from src.strategy.v2b_engine import _is_settlement_day
 
     t = raw["ts"].dt.time

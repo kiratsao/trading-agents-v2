@@ -113,7 +113,9 @@ class TestRegressionDailyUpdaterFailureAlertsLine:
 
     def test_failure_calls_notify(self, tmp_path):
         pq = tmp_path / "test.parquet"
-        dates = pd.bdate_range("2026-04-07", periods=3)
+        # Last bar = Apr 7 (Mon), today = Apr 10 (Thu), yesterday = Apr 9 (Wed)
+        # → fetch_start = Apr 8, end = Apr 9, _fetch_and_aggregate will fire
+        dates = pd.bdate_range("2026-04-03", periods=3)  # Apr 3,6,7
         df = pd.DataFrame(
             {"open": [1.0]*3, "high": [2.0]*3, "low": [0.5]*3,
              "close": [1.5]*3, "volume": [100]*3},
@@ -141,8 +143,9 @@ class TestRegressionZeroBarsOnTradingDayWarns:
 
     def test_zero_bars_weekday_warns(self, tmp_path):
         pq = tmp_path / "test.parquet"
-        # Last bar is Friday 04/17 → fetch_start=04/18, today=04/20 (Mon)
-        dates = pd.bdate_range("2026-04-15", periods=3)  # Wed/Thu/Fri
+        # Last bar is Wed 04/15 → today=04/21(Tue), yesterday=04/20(Mon)
+        # fetch_start=04/16, end=04/20, but fetch returns None → 🔴 data gap
+        dates = pd.bdate_range("2026-04-13", periods=3)  # Mon/Tue/Wed
         df = pd.DataFrame(
             {"open": [1.0]*3, "high": [2.0]*3, "low": [0.5]*3,
              "close": [1.5]*3, "volume": [100]*3},
@@ -152,10 +155,10 @@ class TestRegressionZeroBarsOnTradingDayWarns:
         df.to_parquet(pq)
         notify = MagicMock()
 
-        # Monday 04/20: fetch returns empty → should warn
+        # Tuesday 04/21: fetch returns empty → should alert (data gap)
         with (
             patch("src.data.daily_updater._today_taipei",
-                  return_value=pd.Timestamp("2026-04-20").date()),
+                  return_value=pd.Timestamp("2026-04-21").date()),
             patch("src.data.daily_updater._fetch_and_aggregate",
                   return_value=None),
         ):
@@ -163,7 +166,7 @@ class TestRegressionZeroBarsOnTradingDayWarns:
 
         assert result["bars_added"] == 0
         notify.assert_called_once()
-        assert "⚠️" in notify.call_args[0][0]
+        assert "🔴" in notify.call_args[0][0]
 
 
 class TestRegressionFreshBrokerPerJob:
