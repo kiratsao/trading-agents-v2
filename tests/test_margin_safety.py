@@ -9,7 +9,7 @@ from src.strategy.v2b_engine import _MTX_MARGIN, _anti_martingale_contracts
 
 class TestMarginSafety:
     def test_contracts_capped_by_margin(self):
-        """equity=400K, margin=119250 → floor(400000/119250)=3, ladder says 2 → 2."""
+        """equity=400K, margin=131500 → floor(400000/131500)=3, ladder says 2 → 2."""
         n = _anti_martingale_contracts(400_000)
         assert n == 2  # ladder default: 350K→2, 480K→3
 
@@ -32,7 +32,7 @@ class TestMarginSafety:
 
         from src.strategy.v2b_engine import V2bEngine
 
-        # Equity 250K → floor(250000/119250) = 2 max contracts
+        # Equity 250K → floor(250000/131500) = 1 max contract
         # Already holding 2 → no room to add
         engine = V2bEngine(
             product="MXF", ema_fast=30, ema_slow=100,

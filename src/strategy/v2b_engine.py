@@ -38,13 +38,14 @@ class Signal:
         return f"Signal(action={self.action!r}, contracts={self.contracts}, reason={self.reason!r})"
 
 
-_MTX_MARGIN: float = 119_250.0  # NTD original margin per MTX/MXF contract
+_MTX_MARGIN: float = 131_500.0  # NTD original margin per MTX/MXF contract (TAIFEX 2026-04-27)
 
 
 def _anti_martingale_contracts(
     equity: float,
     ladder: list[dict] | None = None,
     max_contracts: int | None = None,
+    margin_per_contract: float | None = None,
 ) -> int:
     """Anti-martingale scale ladder with margin safety cap + hard ceiling.
 
@@ -58,6 +59,7 @@ def _anti_martingale_contracts(
             {"equity": 480_000, "contracts": 3},
             {"equity": 600_000, "contracts": 4},
         ]
+    margin = margin_per_contract if margin_per_contract is not None else _MTX_MARGIN
     n = 1
     for entry in sorted(ladder, key=lambda x: x["equity"]):
         if equity >= entry["equity"]:
@@ -65,7 +67,7 @@ def _anti_martingale_contracts(
 
     # Margin safety cap
     import math
-    max_by_margin = math.floor(equity / _MTX_MARGIN)
+    max_by_margin = math.floor(equity / margin)
     n = min(n, max(1, max_by_margin))
 
     # Hard ceiling from config
@@ -120,7 +122,7 @@ class V2bEngine:
     def __init__(
         self,
         product: str = "MTX",
-        ema_fast: int = 40,
+        ema_fast: int = 30,
         ema_slow: int = 100,
         atr_period: int = 14,
         confirm_days: int = 3,
@@ -134,7 +136,8 @@ class V2bEngine:
         chandelier_lookback: int = 20,
         chandelier_mult: float = 3.0,
         use_hma: bool = False,
-        dynamic_stop: bool = True,
+        dynamic_stop: bool = False,
+        margin_per_contract: float | None = None,
     ) -> None:
         product = product.upper()
         if product not in _TICK_VALUE:
@@ -155,6 +158,7 @@ class V2bEngine:
         self.max_contracts = max_contracts
         self.exit_mode = exit_mode
         self.chandelier_lookback = chandelier_lookback
+        self.margin_per_contract = margin_per_contract
         self.chandelier_mult = chandelier_mult
         self.use_hma = use_hma
         self.dynamic_stop = dynamic_stop
@@ -220,7 +224,9 @@ class V2bEngine:
             current_mult = self.trail_atr_mult * factor
             current_mult = max(1.0, min(3.0, current_mult))
 
-        n_contracts = _anti_martingale_contracts(equity, self.ladder, self.max_contracts)
+        n_contracts = _anti_martingale_contracts(
+            equity, self.ladder, self.max_contracts, self.margin_per_contract,
+        )
 
         # ── Settlement day force-close (only affects existing positions) ──
         if current_position > 0 and _is_settlement_day(cur_ts):
@@ -280,7 +286,8 @@ class V2bEngine:
                 add_n = max(1, round((contracts or current_position) * self.pyramid_size_fraction))
                 # Margin safety cap: total position must not exceed floor(equity / margin)
                 cur_contracts = contracts or current_position
-                max_total = max(1, _math.floor(equity / _MTX_MARGIN))
+                _margin = self.margin_per_contract or _MTX_MARGIN
+                max_total = max(1, _math.floor(equity / _margin))
                 # Hard ceiling from config
                 if self.max_contracts is not None and self.max_contracts > 0:
                     max_total = min(max_total, self.max_contracts)

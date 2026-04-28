@@ -55,7 +55,7 @@ from src.strategy.v2b_engine import V2bEngine  # noqa: E402
 TICK_VALUE: float = 50.0        # NTD per index point, MXF / MTX
 COST_PER_SIDE: float = 160.0    # NTD commission per side
 ROUND_TRIP: float = COST_PER_SIDE * 2
-MTX_MARGIN: float = 119_250.0   # NTD original margin per MTX/MXF contract
+MTX_MARGIN: float = 131_500.0   # NTD original margin per MTX/MXF contract (TAIFEX 2026-04-27)
 
 DATA_CANDIDATES = [
     ROOT / "data" / "MXF_Daily_Clean_2020_to_now.parquet",
@@ -91,14 +91,14 @@ def run_backtest(
     data: pd.DataFrame,
     initial_capital: float = 350_000.0,
     exec_timing: str = "next_day_open",  # "next_day_open" | "same_day_close"
-    ema_fast: int = 40,
+    ema_fast: int = 30,
     ema_slow: int = 100,
     atr_stop_mult: float = 2.0,
     confirm_days: int = 2,
     ladder: list[dict] | None = None,
     verbose: bool = False,
     use_hma: bool = False,
-    dynamic_stop: bool = True,
+    dynamic_stop: bool = False,
 ) -> tuple[pd.Series, list[Trade], dict]:
     """Run V2b ground-truth backtest.
 
@@ -495,8 +495,8 @@ def main(argv=None) -> None:
     p.add_argument("--save", action="store_true", help="Save trades + equity curve to results/")
     p.add_argument("--verbose", action="store_true", help="Print each trade as it executes")
     p.add_argument("--use_hma", action="store_true", help="Use Hull Moving Average instead of EMA")
-    p.add_argument("--no_dynamic_stop", action="store_true", help="Disable dynamic ATR stop")
-    p.add_argument("--ema_fast", type=int, default=40, help="Fast EMA period")
+    p.add_argument("--dynamic_stop", action="store_true", help="Use dynamic ATR stop based on ADX")
+    p.add_argument("--ema_fast", type=int, default=30, help="Fast EMA period")
     p.add_argument("--ema_slow", type=int, default=100, help="Slow EMA period")
     args = p.parse_args(argv)
 
@@ -511,7 +511,7 @@ def main(argv=None) -> None:
         exec_timing=args.exec_timing,
         verbose=args.verbose,
         use_hma=args.use_hma,
-        dynamic_stop=not args.no_dynamic_stop,
+        dynamic_stop=args.dynamic_stop,
         ema_fast=args.ema_fast,
         ema_slow=args.ema_slow,
     )

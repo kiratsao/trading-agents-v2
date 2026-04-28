@@ -34,13 +34,16 @@ class TestDailyUpdater:
         _make_existing_parquet(pq, "2026-04-07")
 
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)),
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
             patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
         ):
             new_bar = pd.DataFrame(
                 {"open": [33300.0], "high": [33500.0], "low": [33250.0],
                  "close": [33450.0], "volume": [120000]},
-                index=pd.DatetimeIndex([pd.Timestamp("2026-04-08")], name="date"),
+                index=pd.DatetimeIndex(
+                    [pd.Timestamp("2026-04-08")], name="date",
+                ),
             )
             mock_fetch.return_value = new_bar
             result = update(parquet_path=pq)
@@ -50,19 +53,50 @@ class TestDailyUpdater:
         assert result["error"] is None
         df = pd.read_parquet(pq)
         assert len(df) == 4
+        # Fetch range should be start→yesterday (2026-04-08)
+        mock_fetch.assert_called_once_with(date(2026, 4, 8), date(2026, 4, 8))
+
+    def test_only_fetches_up_to_yesterday(self, tmp_path):
+        """Core fix: today=2026-04-08 (Tuesday) → fetch only up to 2026-04-07."""
+        pq = tmp_path / "test.parquet"
+        _make_existing_parquet(pq, "2026-04-04")
+
+        with (
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 8)),
+            patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
+        ):
+            new_bar = pd.DataFrame(
+                {"open": [33300.0], "high": [33500.0], "low": [33250.0],
+                 "close": [33450.0], "volume": [120000]},
+                index=pd.DatetimeIndex(
+                    [pd.Timestamp("2026-04-07")], name="date",
+                ),
+            )
+            mock_fetch.return_value = new_bar
+            result = update(parquet_path=pq)
+
+        # Should fetch up to yesterday=2026-04-07, NOT today=2026-04-08
+        # fetch_start = last_date+1 (bdate after 2026-04-04 is 2026-04-05)
+        args = mock_fetch.call_args[0]
+        assert args[1] == date(2026, 4, 7), "end must be yesterday, not today"
+        assert result["bars_added"] == 1
 
     def test_no_duplicate(self, tmp_path):
         pq = tmp_path / "test.parquet"
         _make_existing_parquet(pq, "2026-04-08")
 
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)),
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
             patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
         ):
             dup_bar = pd.DataFrame(
                 {"open": [33300.0], "high": [33500.0], "low": [33250.0],
                  "close": [33450.0], "volume": [120000]},
-                index=pd.DatetimeIndex([pd.Timestamp("2026-04-08")], name="date"),
+                index=pd.DatetimeIndex(
+                    [pd.Timestamp("2026-04-08")], name="date",
+                ),
             )
             mock_fetch.return_value = dup_bar
             result = update(parquet_path=pq)
@@ -74,7 +108,8 @@ class TestDailyUpdater:
         _make_existing_parquet(pq, "2026-04-10")
 
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 13)),
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 14)),
             patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
         ):
             bars = pd.DataFrame(
@@ -99,8 +134,28 @@ class TestDailyUpdater:
         _make_existing_parquet(pq, "2026-04-07")
 
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)),
-            patch("src.data.daily_updater._fetch_and_aggregate", return_value=None),
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
+            patch("src.data.daily_updater._fetch_and_aggregate",
+                  return_value=None),
+        ):
+            notify = MagicMock()
+            result = update(parquet_path=pq, notify_fn=notify)
+
+        # bars_added=0 AND latest < yesterday → should FAIL with 🔴 alert
+        assert result["success"] is False
+        assert result["bars_added"] == 0
+        notify.assert_called_once()
+        assert "🔴" in notify.call_args[0][0]
+
+    def test_empty_kbars_already_current(self, tmp_path):
+        """bars_added=0 but latest_date = yesterday → OK."""
+        pq = tmp_path / "test.parquet"
+        _make_existing_parquet(pq, "2026-04-08")
+
+        with (
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
         ):
             result = update(parquet_path=pq)
 
@@ -111,7 +166,8 @@ class TestDailyUpdater:
         pq = tmp_path / "test.parquet"
         _make_existing_parquet(pq, "2026-04-08")
 
-        with patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)):
+        with patch("src.data.daily_updater._today_taipei",
+                   return_value=date(2026, 4, 9)):
             result = update(parquet_path=pq)
 
         assert result["success"] is True
@@ -122,13 +178,16 @@ class TestDailyUpdater:
         _make_existing_parquet(pq, "2026-04-07")
 
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)),
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
             patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
         ):
             new_bar = pd.DataFrame(
                 {"open": [33300.0], "high": [33500.0], "low": [33250.0],
                  "close": [33450.0], "volume": [120000]},
-                index=pd.DatetimeIndex([pd.Timestamp("2026-04-08")], name="date"),
+                index=pd.DatetimeIndex(
+                    [pd.Timestamp("2026-04-08")], name="date",
+                ),
             )
             mock_fetch.return_value = new_bar
             update(parquet_path=pq)
@@ -141,15 +200,18 @@ class TestDailyUpdater:
 
         # Second update should not crash on .normalize()
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 9)),
-            patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch2,
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 10)),
+            patch("src.data.daily_updater._fetch_and_aggregate") as mock2,
         ):
             bar2 = pd.DataFrame(
                 {"open": [33500.0], "high": [33600.0], "low": [33400.0],
                  "close": [33550.0], "volume": [100000]},
-                index=pd.DatetimeIndex([pd.Timestamp("2026-04-09")], name="date"),
+                index=pd.DatetimeIndex(
+                    [pd.Timestamp("2026-04-09")], name="date",
+                ),
             )
-            mock_fetch2.return_value = bar2
+            mock2.return_value = bar2
             result = update(parquet_path=pq)
 
         assert result["success"] is True
@@ -162,7 +224,8 @@ class TestDailyUpdater:
         notify = MagicMock()
 
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)),
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
             patch("src.data.daily_updater._fetch_and_aggregate",
                   side_effect=ConnectionError("timeout")),
         ):
@@ -180,13 +243,16 @@ class TestDailyUpdater:
         notify = MagicMock()
 
         with (
-            patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 8)),
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
             patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
         ):
             new_bar = pd.DataFrame(
                 {"open": [33300.0], "high": [33500.0], "low": [33250.0],
                  "close": [33450.0], "volume": [120000]},
-                index=pd.DatetimeIndex([pd.Timestamp("2026-04-08")], name="date"),
+                index=pd.DatetimeIndex(
+                    [pd.Timestamp("2026-04-08")], name="date",
+                ),
             )
             mock_fetch.return_value = new_bar
             result = update(parquet_path=pq, notify_fn=notify)
@@ -195,3 +261,21 @@ class TestDailyUpdater:
         notify.assert_called_once()
         assert "✅" in notify.call_args[0][0]
         assert "33,450" in notify.call_args[0][0]
+
+    def test_data_gap_alerts(self, tmp_path):
+        """If parquet is 3 days behind and no bars fetched → 🔴 alert."""
+        pq = tmp_path / "test.parquet"
+        _make_existing_parquet(pq, "2026-04-03")
+        notify = MagicMock()
+
+        with (
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 4, 9)),
+            patch("src.data.daily_updater._fetch_and_aggregate",
+                  return_value=None),
+        ):
+            result = update(parquet_path=pq, notify_fn=notify)
+
+        assert result["success"] is False
+        assert "🔴" in notify.call_args[0][0]
+        assert "資料缺口" in notify.call_args[0][0]
