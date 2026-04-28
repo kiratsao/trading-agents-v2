@@ -58,6 +58,7 @@ ROUND_TRIP: float = COST_PER_SIDE * 2
 MTX_MARGIN: float = 131_500.0   # NTD original margin per MTX/MXF contract (TAIFEX 2026-04-27)
 
 DATA_CANDIDATES = [
+    ROOT / "data" / "MXF_Daily_Clean_2020_to_now.parquet",
     ROOT / "data" / "TXF_Daily_Real.parquet",
     Path.home() / "trading-agents-v2" / "data" / "TXF_Daily_Real.parquet",
     Path("../trading-agents-v2/data/TXF_Daily_Real.parquet"),
@@ -96,6 +97,8 @@ def run_backtest(
     confirm_days: int = 2,
     ladder: list[dict] | None = None,
     verbose: bool = False,
+    use_hma: bool = False,
+    dynamic_stop: bool = False,
 ) -> tuple[pd.Series, list[Trade], dict]:
     """Run V2b ground-truth backtest.
 
@@ -118,6 +121,8 @@ def run_backtest(
         trail_atr_mult=atr_stop_mult,
         confirm_days=confirm_days,
         ladder=_ladder,
+        use_hma=use_hma,
+        dynamic_stop=dynamic_stop,
     )
 
     df = data.copy()
@@ -489,6 +494,10 @@ def main(argv=None) -> None:
                    help="Show trade-by-trade diff vs old engine")
     p.add_argument("--save", action="store_true", help="Save trades + equity curve to results/")
     p.add_argument("--verbose", action="store_true", help="Print each trade as it executes")
+    p.add_argument("--use_hma", action="store_true", help="Use Hull Moving Average instead of EMA")
+    p.add_argument("--dynamic_stop", action="store_true", help="Use dynamic ATR stop based on ADX")
+    p.add_argument("--ema_fast", type=int, default=30, help="Fast EMA period")
+    p.add_argument("--ema_slow", type=int, default=100, help="Slow EMA period")
     args = p.parse_args(argv)
 
     df = _load_data()
@@ -501,6 +510,10 @@ def main(argv=None) -> None:
         initial_capital=args.initial_capital,
         exec_timing=args.exec_timing,
         verbose=args.verbose,
+        use_hma=args.use_hma,
+        dynamic_stop=args.dynamic_stop,
+        ema_fast=args.ema_fast,
+        ema_slow=args.ema_slow,
     )
 
     _print_metrics(f"verify_engine  [{args.exec_timing}]", metrics)

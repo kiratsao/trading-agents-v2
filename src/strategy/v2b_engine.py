@@ -20,6 +20,7 @@ import pandas as pd
 from src.strategy.common.indicators import adx as calc_adx
 from src.strategy.common.indicators import atr as calc_atr
 from src.strategy.common.indicators import ema as calc_ema
+from src.strategy.common.indicators import hma as calc_hma
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,8 @@ class V2bEngine:
         exit_mode: str = "trailing",
         chandelier_lookback: int = 20,
         chandelier_mult: float = 3.0,
+        use_hma: bool = False,
+        dynamic_stop: bool = False,
         margin_per_contract: float | None = None,
     ) -> None:
         product = product.upper()
@@ -157,6 +160,8 @@ class V2bEngine:
         self.chandelier_lookback = chandelier_lookback
         self.margin_per_contract = margin_per_contract
         self.chandelier_mult = chandelier_mult
+        self.use_hma = use_hma
+        self.dynamic_stop = dynamic_stop
 
     # ------------------------------------------------------------------
     # Public API
@@ -201,15 +206,23 @@ class V2bEngine:
         ind = self._compute_indicators(data)
         latest = ind.iloc[-1]
         close = float(latest["close"])
-        ema_f = float(latest["ema_fast"])
-        ema_s = float(latest["ema_slow"])
+        ma_f = float(latest["fast_ma"])
+        ma_s = float(latest["slow_ma"])
         atr_v = float(latest["atr"])
         adx_v = float(latest["adx"]) if "adx" in latest.index else 0.0
         bull_streak = int(latest["bull_streak"])
         cur_ts = data.index[-1]
 
-        if not (ema_f > 0 and ema_s > 0 and atr_v > 0):
+        if not (ma_f > 0 and ma_s > 0 and atr_v > 0):
             return Signal("hold", 0, "indicators not ready")
+
+        current_mult = self.trail_atr_mult
+        if self.dynamic_stop:
+            # Formula: mult = base_mult * (1.5 - ADX / 50)
+            # Capped between 1.0 and 3.0 to avoid extreme values
+            factor = 1.5 - adx_v / 50.0
+            current_mult = self.trail_atr_mult * factor
+            current_mult = max(1.0, min(3.0, current_mult))
 
         n_contracts = _anti_martingale_contracts(
             equity, self.ladder, self.max_contracts, self.margin_per_contract,
@@ -242,7 +255,7 @@ class V2bEngine:
                         stop_loss=stop,
                     )
             else:
-                trail_stop = hh - self.trail_atr_mult * atr_v
+                trail_stop = hh - current_mult * atr_v
                 if close < trail_stop:
                     tsmc_note = (
                         " [tsmc bearish tighten]"
@@ -257,11 +270,12 @@ class V2bEngine:
                     )
 
             # Death cross
-            if ema_f < ema_s:
+            if ma_f < ma_s:
+                ma_name = "HMA" if self.use_hma else "EMA"
                 return Signal(
                     "close",
                     contracts or current_position,
-                    f"death cross: EMA{self.ema_fast}={ema_f:.0f} < EMA{self.ema_slow}={ema_s:.0f}",
+                    f"death cross: {ma_name}{self.ema_fast}={ma_f:.0f} < {ma_name}{self.ema_slow}={ma_s:.0f}",
                 )
 
             # Pyramid scale-in (per-contract points, same unit as ATR)
@@ -283,17 +297,17 @@ class V2bEngine:
                         "hold",
                         cur_contracts,
                         f"pyramid skipped: margin cap {max_total}口 already reached",
-                        stop_loss=hh - self.trail_atr_mult * atr_v,
+                        stop_loss=hh - current_mult * atr_v,
                     )
                 return Signal(
                     "add",
                     add_n,
                     f"pyramid: float_profit={float_profit:.0f}, add={add_n}",
-                    stop_loss=hh - self.trail_atr_mult * atr_v,
+                    stop_loss=hh - current_mult * atr_v,
                 )
 
             # Hold
-            trail_stop = hh - self.trail_atr_mult * atr_v
+            trail_stop = hh - current_mult * atr_v
             return Signal(
                 "hold",
                 contracts or current_position,
@@ -302,7 +316,7 @@ class V2bEngine:
             )
 
         # ── Flat: check entry ───────────────────────────────────────
-        golden = ema_f > ema_s
+        golden = ma_f > ma_s
         if golden and bull_streak >= self.confirm_days:
             # ADX regime filter: only enter when trend is strong enough
             if self.adx_threshold > 0 and adx_v < self.adx_threshold:
@@ -310,13 +324,14 @@ class V2bEngine:
                     "hold", 0,
                     f"ADX too low — no trend (ADX={adx_v:.1f} < {self.adx_threshold})",
                 )
-            trail_stop = close - self.trail_atr_mult * atr_v
+            trail_stop = close - current_mult * atr_v
+            ma_name = "HMA" if self.use_hma else "EMA"
             return Signal(
                 "buy",
                 n_contracts,
                 (
                     f"golden cross + {bull_streak}-day confirmation: "
-                    f"EMA{self.ema_fast}={ema_f:.0f} > EMA{self.ema_slow}={ema_s:.0f}"
+                    f"{ma_name}{self.ema_fast}={ma_f:.0f} > {ma_name}{self.ema_slow}={ma_s:.0f}"
                     f" ADX={adx_v:.0f}"
                 ),
                 stop_loss=trail_stop,
@@ -329,7 +344,7 @@ class V2bEngine:
             and golden
             and bull_streak >= max(1, self.confirm_days - 1)
         ):
-            trail_stop = close - self.trail_atr_mult * atr_v
+            trail_stop = close - current_mult * atr_v
             return Signal(
                 "buy",
                 n_contracts,
@@ -351,13 +366,18 @@ class V2bEngine:
 
     def _compute_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         ind = df.copy()
-        ind["ema_fast"] = calc_ema(df["close"], self.ema_fast)
-        ind["ema_slow"] = calc_ema(df["close"], self.ema_slow)
+        if self.use_hma:
+            ind["fast_ma"] = calc_hma(df["close"], self.ema_fast)
+            ind["slow_ma"] = calc_hma(df["close"], self.ema_slow)
+        else:
+            ind["fast_ma"] = calc_ema(df["close"], self.ema_fast)
+            ind["slow_ma"] = calc_ema(df["close"], self.ema_slow)
+            
         ind["atr"] = calc_atr(df, self.atr_period)
         ind["adx"] = calc_adx(df, 14)
 
-        # bull_streak: consecutive bars with ema_fast > ema_slow
-        bull = (ind["ema_fast"] > ind["ema_slow"]).astype(int)
+        # bull_streak: consecutive bars with fast_ma > slow_ma
+        bull = (ind["fast_ma"] > ind["slow_ma"]).astype(int)
         streaks = []
         s = 0
         for v in bull:
