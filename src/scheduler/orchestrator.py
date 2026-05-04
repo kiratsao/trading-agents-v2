@@ -90,7 +90,7 @@ class V2bOrchestrator:
         Returns a summary dict with action, reason, and optional tsmc info.
         """
         tsmc_signal = self._fetch_tsmc_signal() if self.enable_tsmc_signal else None
-        df = self._load_data()
+        df = self._load_data(broker=broker)
         if df is None or len(df) < 1:
             logger.error("No market data available.")
             return {"action": "error", "reason": "no data"}
@@ -241,7 +241,7 @@ class V2bOrchestrator:
         Returns signal dict with action/contracts/reason.
         """
         tsmc_signal = self._fetch_tsmc_signal() if self.enable_tsmc_signal else None
-        df = self._load_data()
+        df = self._load_data(broker=broker)
         if df is None or len(df) < 1:
             logger.error("No market data available.")
             return {"action": "error", "reason": "no data"}
@@ -360,7 +360,7 @@ class V2bOrchestrator:
 
         # Resolve execution price
         if exec_price is None:
-            df = self._load_data()
+            df = self._load_data(broker=broker)
             exec_price = float(df["close"].iloc[-1]) if (df is not None and len(df) > 0) else 0.0
 
         result: dict = {
@@ -406,7 +406,7 @@ class V2bOrchestrator:
 
             # ── Settlement rollover: re-check entry immediately ───
             if is_settlement:
-                df = self._load_data()
+                df = self._load_data(broker=broker)
                 if df is not None and len(df) > 0:
                     re_sig = self.strategy.generate_signal(
                         data=df,
@@ -654,8 +654,14 @@ class V2bOrchestrator:
             logger.warning("TSMC signal fetch failed — proceeding without bias: %s", exc)
             return None
 
-    def _load_data(self) -> pd.DataFrame | None:
+    def _load_data(self, broker=None) -> pd.DataFrame | None:
         """Load daily OHLCV data.
+
+        Parameters
+        ----------
+        broker :
+            Optional ShioajiAdapter to reuse for fetching today's bar.
+            Avoids creating a second connection that steals the session.
 
         Strategy:
           1. Load historical data from parquet (baseline).
@@ -683,8 +689,9 @@ class V2bOrchestrator:
         df = df.sort_index()
 
         # Try to fetch today's bar from Shioaji (live mode only; skip in simulation to avoid
-        # multiple rapid connections that cause segfaults in the Shioaji C extension)
-        today_bar = _fetch_today_bar_shioaji(simulation=False) if self.live else None
+        # multiple rapid connections that cause segfaults in the Shioaji C extension).
+        # Pass broker so we reuse the existing connection instead of creating a second one.
+        today_bar = _fetch_today_bar_shioaji(simulation=False, broker=broker) if self.live else None
         if today_bar is not None:
             today_ts = pd.Timestamp(today_bar["date"])
             if today_ts not in df.index:
@@ -721,12 +728,12 @@ class V2bOrchestrator:
         return df
 
 
-def _fetch_today_bar_shioaji(simulation: bool = True) -> dict | None:
+def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | None:
     """Try to fetch today's day-session daily bar from Shioaji API.
 
-    Uses ShioajiAdapter (which correctly loads contracts) then aggregates
-    1-minute kbars for the day session (08:45–13:45 Asia/Taipei) into a
-    single OHLCV bar.
+    Uses an existing *broker* (ShioajiAdapter) when provided so that a
+    second login does not steal the caller's session.  Falls back to
+    creating a temporary adapter only when no broker is given.
 
     Returns a dict with open/high/low/close/volume/date, or None on failure.
     """
@@ -736,34 +743,39 @@ def _fetch_today_bar_shioaji(simulation: bool = True) -> dict | None:
 
         import pandas as pd
 
-        api_key = os.environ.get("SHIOAJI_API_KEY", "")
-        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
-        if not api_key or not secret_key:
-            return None
+        # Reuse existing broker connection if available
+        owns_adapter = broker is None
+        if owns_adapter:
+            api_key = os.environ.get("SHIOAJI_API_KEY", "")
+            secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
+            if not api_key or not secret_key:
+                return None
 
-        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+            from tw_futures.executor.shioaji_adapter import ShioajiAdapter
 
-        adapter = ShioajiAdapter(
-            api_key=api_key,
-            secret_key=secret_key,
-            simulation=simulation,
-            cert_path=os.environ.get("SHIOAJI_CERT_PATH") or None,
-            cert_password=os.environ.get("SHIOAJI_CERT_PASSWORD") or None,
-            person_id=os.environ.get("SHIOAJI_PERSON_ID") or None,
-        )
+            broker = ShioajiAdapter(
+                api_key=api_key,
+                secret_key=secret_key,
+                simulation=simulation,
+                cert_path=os.environ.get("SHIOAJI_CERT_PATH") or None,
+                cert_password=os.environ.get("SHIOAJI_CERT_PASSWORD") or None,
+                person_id=os.environ.get("SHIOAJI_PERSON_ID") or None,
+            )
 
         today = date.today()
         # Use tomorrow as end so Shioaji includes all of today's bars
         tomorrow = pd.Timestamp(today) + pd.Timedelta(days=1)
 
-        contract = adapter.get_contract("MXF")
-        kbars = adapter._api.kbars(
+        contract = broker.get_contract("MXF")
+        kbars = broker._api.kbars(
             contract,
             start=str(today),
             end=str(tomorrow.date()),
             timeout=15_000,
         )
-        adapter.logout()
+        # Only logout if we created the adapter ourselves
+        if owns_adapter:
+            broker.logout()
 
         if not kbars or len(kbars.ts) == 0:
             logger.debug("_fetch_today_bar_shioaji: empty kbars for %s", today)
