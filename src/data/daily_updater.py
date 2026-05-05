@@ -123,8 +123,15 @@ def update(
             "error": None,
         }
 
-    # 4. Filter weekends
+    # 4. Filter weekends + TAIFEX holidays
     new_bars = new_bars[new_bars.index.dayofweek < 5]
+    from src.data.tw_holidays import is_taifex_holiday
+
+    holiday_mask = new_bars.index.map(lambda ts: is_taifex_holiday(ts.date()))
+    if holiday_mask.any():
+        removed = new_bars.index[holiday_mask].strftime("%Y-%m-%d").tolist()
+        logger.info("daily_updater: removed %d holiday bars: %s", len(removed), removed)
+        new_bars = new_bars[~holiday_mask]
     if new_bars.empty:
         return {
             "success": True,
@@ -180,13 +187,11 @@ def update(
 def _last_trading_day(ref: date) -> date:
     """Return the most recent completed trading day before *ref*.
 
-    Skips weekends. Does not account for TAIFEX holidays — those will
-    simply return bars_added=0 with success=True (not a data gap).
+    Skips weekends and TAIFEX holidays.
     """
-    d = ref - timedelta(days=1)
-    while d.weekday() >= 5:  # Saturday=5, Sunday=6
-        d -= timedelta(days=1)
-    return d
+    from src.data.tw_holidays import last_trading_day_before
+
+    return last_trading_day_before(ref)
 
 
 def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:

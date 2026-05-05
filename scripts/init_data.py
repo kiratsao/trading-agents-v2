@@ -155,6 +155,16 @@ def main():
     daily = daily[daily.index.dayofweek < 5]
     daily = daily[~daily.index.duplicated(keep="last")]
 
+    # Remove TAIFEX holidays (e.g. 5/1 勞動節 — 夜盤 bar 被誤歸該日)
+    from src.data.tw_holidays import is_taifex_holiday
+
+    holiday_mask = daily.index.map(lambda ts: is_taifex_holiday(ts.date()))
+    n_holidays = holiday_mask.sum()
+    if n_holidays > 0:
+        removed_dates = daily.index[holiday_mask].strftime("%Y-%m-%d").tolist()
+        print(f"  Removed {n_holidays} holiday bars: {removed_dates[:10]}")
+        daily = daily[~holiday_mask]
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     daily.to_parquet(OUT_PATH, index=True)
     print(f"\nSaved: {OUT_PATH}")

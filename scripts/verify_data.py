@@ -26,17 +26,36 @@ def main():
 
     issues = []
 
-    # 1. Latest date
+    # 1. Latest date — gap measured in trading days (excludes weekends + TAIFEX holidays)
     latest = df.index[-1].date()
     today = pd.Timestamp.now(tz="Asia/Taipei").date()
-    gap = (today - latest).days
-    if gap > 3:
-        issues.append(f"STALE: latest={latest}, today={today}, gap={gap} days")
 
-    # 2. Weekend bars
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.data.tw_holidays import trading_days_between
+
+    trading_gap = len(trading_days_between(latest, today)) - 1  # exclude latest itself
+    calendar_gap = (today - latest).days
+    if trading_gap > 3:
+        issues.append(
+            f"STALE: latest={latest}, today={today}, "
+            f"gap={trading_gap} trading days ({calendar_gap} calendar)"
+        )
+
+    # 2. Weekend bars + holiday bars
     weekend = df[df.index.dayofweek >= 5]
     if len(weekend) > 0:
         issues.append(f"WEEKEND BARS: {len(weekend)} rows on Sat/Sun")
+
+    from src.data.tw_holidays import is_taifex_holiday
+
+    holiday_mask = (df.index.dayofweek < 5) & df.index.map(
+        lambda ts: is_taifex_holiday(ts.date())
+    )
+    if holiday_mask.any():
+        dates_str = df.index[holiday_mask].strftime("%Y-%m-%d").tolist()[:5]
+        issues.append(
+            f"HOLIDAY BARS: {holiday_mask.sum()} rows on TAIFEX holidays ({dates_str})"
+        )
 
     # 3. Duplicate dates
     dups = df.index[df.index.duplicated()]
@@ -58,7 +77,7 @@ def main():
     print(f"  Bars: {len(df)}")
     print(f"  Range: {df.index[0].date()} → {latest}")
     print(f"  Last close: {df['close'].iloc[-1]:,.0f}")
-    print(f"  Gap to today: {gap} day(s)")
+    print(f"  Gap to today: {trading_gap} trading days ({calendar_gap} calendar)")
 
     if issues:
         print(f"\n  ISSUES ({len(issues)}):")
