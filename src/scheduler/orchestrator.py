@@ -729,30 +729,35 @@ class V2bOrchestrator:
 
 
 def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | None:
-    """Try to fetch today's day-session daily bar from Shioaji API.
+    """Fetch today's day-session daily bar from Shioaji kbars (1-min aggregation).
+
+    Strategy (matches daily_updater logic exactly):
+      1. Fetch today's 1-min kbars via Shioaji API
+      2. Filter to day-session only (08:45–13:44)
+      3. Aggregate OHLCV: open=first, high=max, low=min, close=last bar's close
+      4. If kbars fails → fallback to snapshot (less accurate but better than nothing)
 
     Uses an existing *broker* (ShioajiAdapter) when provided so that a
-    second login does not steal the caller's session.  Falls back to
-    creating a temporary adapter only when no broker is given.
+    second login does not steal the caller's session.
 
     Returns a dict with open/high/low/close/volume/date, or None on failure.
     """
-    try:
-        import os
-        from datetime import date, time
+    import os
+    from datetime import date, time
 
-        import pandas as pd
+    import pandas as pd
 
-        # Reuse existing broker connection if available
-        owns_adapter = broker is None
-        if owns_adapter:
-            api_key = os.environ.get("SHIOAJI_API_KEY", "")
-            secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
-            if not api_key or not secret_key:
-                return None
+    # Reuse existing broker connection if available
+    owns_adapter = broker is None
+    if owns_adapter:
+        api_key = os.environ.get("SHIOAJI_API_KEY", "")
+        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
+        if not api_key or not secret_key:
+            return None
 
-            from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
 
+        try:
             broker = ShioajiAdapter(
                 api_key=api_key,
                 secret_key=secret_key,
@@ -761,11 +766,15 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
                 cert_password=os.environ.get("SHIOAJI_CERT_PASSWORD") or None,
                 person_id=os.environ.get("SHIOAJI_PERSON_ID") or None,
             )
+        except Exception as exc:
+            logger.debug("_fetch_today_bar_shioaji: broker creation failed: %s", exc)
+            return None
 
-        today = date.today()
-        # Use tomorrow as end so Shioaji includes all of today's bars
+    today = date.today()
+
+    # --- Primary: 1-min kbars aggregation (exact day-session close) ---
+    try:
         tomorrow = pd.Timestamp(today) + pd.Timedelta(days=1)
-
         contract = broker.get_contract("MXF")
         kbars = broker._api.kbars(
             contract,
@@ -773,59 +782,92 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
             end=str(tomorrow.date()),
             timeout=15_000,
         )
-        # Only logout if we created the adapter ourselves
-        if owns_adapter:
-            broker.logout()
 
-        if not kbars or len(kbars.ts) == 0:
-            logger.debug("_fetch_today_bar_shioaji: empty kbars for %s", today)
-            return None
+        if kbars and len(kbars.ts) > 0:
+            df = pd.DataFrame(
+                {
+                    "ts": kbars.ts,
+                    "open": kbars.Open,
+                    "high": kbars.High,
+                    "low": kbars.Low,
+                    "close": kbars.Close,
+                    "volume": kbars.Volume,
+                }
+            )
+            df["ts"] = pd.to_datetime(df["ts"], unit="ns", utc=True).dt.tz_convert(
+                "Asia/Taipei"
+            )
+            df = df.sort_values("ts")
 
-        df = pd.DataFrame(
-            {
-                "ts": kbars.ts,
-                "open": kbars.Open,
-                "high": kbars.High,
-                "low": kbars.Low,
-                "close": kbars.Close,
-                "volume": kbars.Volume,
-            }
-        )
-        df["ts"] = pd.to_datetime(df["ts"], unit="ns", utc=True).dt.tz_convert("Asia/Taipei")
+            # Day session: 08:45–13:44 (normal) or 08:45–13:29 (settlement)
+            from src.strategy.v2b_engine import _is_settlement_day
 
-        # Sort by timestamp to ensure first/last are chronologically correct
-        df = df.sort_values("ts")
+            day_open = time(8, 45)
+            day_close = (
+                time(13, 30) if _is_settlement_day(pd.Timestamp(today)) else time(13, 45)
+            )
+            today_mask = (
+                (df["ts"].dt.date == today)
+                & (df["ts"].dt.time >= day_open)
+                & (df["ts"].dt.time < day_close)
+            )
+            day_df = df[today_mask]
 
-        # Day session: 08:45-13:44 normal, 08:45-13:29 settlement day
-        from src.strategy.v2b_engine import _is_settlement_day
-        day_open = time(8, 45)
-        day_close = time(13, 30) if _is_settlement_day(pd.Timestamp(today)) else time(13, 45)
-        today_mask = (
-            (df["ts"].dt.date == today)
-            & (df["ts"].dt.time >= day_open)
-            & (df["ts"].dt.time < day_close)
-        )
-        day_df = df[today_mask]
+            if not day_df.empty:
+                result = {
+                    "date": str(today),
+                    "open": float(day_df.iloc[0]["open"]),
+                    "high": float(day_df["high"].max()),
+                    "low": float(day_df["low"].min()),
+                    "close": float(day_df.iloc[-1]["close"]),
+                    "volume": int(day_df["volume"].sum()),
+                }
+                logger.info(
+                    "_fetch_today_bar_shioaji: kbars OK  close=%.0f  bars=%d",
+                    result["close"],
+                    len(day_df),
+                )
+                if owns_adapter:
+                    broker.logout()
+                return result
 
-        if day_df.empty:
             logger.debug(
-                "_fetch_today_bar_shioaji: no day-session bars for %s (got %d total bars)",
-                today,
+                "_fetch_today_bar_shioaji: no day-session bars in kbars (total=%d)",
                 len(df),
             )
-            return None
+        else:
+            logger.debug("_fetch_today_bar_shioaji: kbars empty for %s", today)
 
-        return {
-            "date": str(today),
-            "open": float(day_df.iloc[0]["open"]),
-            "high": float(day_df["high"].max()),
-            "low": float(day_df["low"].min()),
-            "close": float(day_df.iloc[-1]["close"]),
-            "volume": int(day_df["volume"].sum()),
-        }
     except Exception as exc:
-        logger.debug("_fetch_today_bar_shioaji failed: %s", exc)
-        return None
+        logger.warning("_fetch_today_bar_shioaji: kbars failed: %s — trying snapshot", exc)
+
+    # --- Fallback: snapshot (last traded price — may differ from 13:44 close) ---
+    try:
+        snap = broker.get_snapshots("MXF")
+        close = float(snap["close"])
+        logger.warning(
+            "_fetch_today_bar_shioaji: using SNAPSHOT fallback  close=%.0f "
+            "(⚠️ may not be 13:44 day-session close)",
+            close,
+        )
+        result = {
+            "date": str(today),
+            "open": float(snap.get("open", close)),
+            "high": float(snap.get("high", close)),
+            "low": float(snap.get("low", close)),
+            "close": close,
+            "volume": int(snap.get("total_volume", 0)),
+            "_source": "snapshot",  # flag for callers to detect fallback
+        }
+        if owns_adapter:
+            broker.logout()
+        return result
+    except Exception as snap_exc:
+        logger.debug("_fetch_today_bar_shioaji: snapshot also failed: %s", snap_exc)
+
+    if owns_adapter:
+        broker.logout()
+    return None
 
 
 def _query_live_equity(broker, fallback_equity: float) -> tuple[float, str]:
