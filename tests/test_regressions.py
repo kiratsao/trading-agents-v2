@@ -201,3 +201,141 @@ class TestRegressionParquetNotInGit:
         assert result.stdout.strip() == "", (
             f"Parquet files still tracked: {result.stdout.strip()}"
         )
+
+
+class TestRegressionMktOrderBatchSplit:
+    """Bug: Sell 13 口 MXF 被拒「超過市價單筆委託上限」— 小台市價上限 10 口。"""
+
+    def _make_adapter(self):
+        """Create a ShioajiAdapter with mocked internals."""
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+
+        adapter = object.__new__(ShioajiAdapter)
+        adapter._api = MagicMock()
+        adapter._api.Contracts.Futures.MXF = [
+            MagicMock(delivery_date="2099/12/31", code="MXFZ9"),
+        ]
+        adapter._api.futopt_account = MagicMock()
+        adapter._accounts = []
+        return adapter
+
+    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    def test_submit_order_splits_over_10(self, mock_order_cls):
+        """Market order > 10 contracts must be split into batches."""
+        adapter = self._make_adapter()
+
+        call_count = 0
+
+        def fake_place_order(contract, order):
+            nonlocal call_count
+            call_count += 1
+            trade = MagicMock()
+            trade.status.id = f"ORD-{call_count}"
+            trade.status.status.value = "Filled"
+            return trade
+
+        adapter._api.place_order = fake_place_order
+
+        result = adapter.submit_order("MXF", "Sell", 13, price_type="MKT")
+
+        assert call_count == 2, f"Expected 2 batches, got {call_count}"
+        assert result["contracts"] == 13
+        assert "ORD-1" in result["order_id"]
+        assert "ORD-2" in result["order_id"]
+
+    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    def test_submit_order_no_split_under_limit(self, mock_order_cls):
+        """Orders <= 10 contracts should NOT be split."""
+        adapter = self._make_adapter()
+
+        trade = MagicMock()
+        trade.status.id = "ORD-1"
+        trade.status.status.value = "Filled"
+        adapter._api.place_order.return_value = trade
+
+        result = adapter.submit_order("MXF", "Sell", 10, price_type="MKT")
+
+        adapter._api.place_order.assert_called_once()
+        assert result["contracts"] == 10
+
+    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    def test_limit_order_not_split(self, mock_order_cls):
+        """Limit orders should NOT be split regardless of quantity."""
+        adapter = self._make_adapter()
+
+        trade = MagicMock()
+        trade.status.id = "ORD-1"
+        trade.status.status.value = "Filled"
+        adapter._api.place_order.return_value = trade
+
+        result = adapter.submit_order("MXF", "Buy", 20, price_type="LMT", price=21000.0)
+
+        adapter._api.place_order.assert_called_once()
+        assert result["contracts"] == 20
+
+    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    def test_split_exact_multiple(self, mock_order_cls):
+        """20 contracts = exactly 2 batches of 10, no remainder."""
+        adapter = self._make_adapter()
+
+        call_count = 0
+
+        def fake_place_order(contract, order):
+            nonlocal call_count
+            call_count += 1
+            trade = MagicMock()
+            trade.status.id = f"ORD-{call_count}"
+            trade.status.status.value = "Filled"
+            return trade
+
+        adapter._api.place_order = fake_place_order
+
+        result = adapter.submit_order("MXF", "Buy", 20, price_type="MKT")
+
+        assert call_count == 2
+        assert result["contracts"] == 20
+
+
+class TestRegressionSettlementDayContract:
+    """Bug: Buy 用了已到期合約 MXFE6 — 結算日應取新月份合約。"""
+
+    def test_get_contract_excludes_today_expiry(self):
+        """On settlement day, expiring contract (delivery_date == today) must be skipped."""
+        import datetime as dt
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+
+        adapter = object.__new__(ShioajiAdapter)
+        adapter._api = MagicMock()
+
+        # Simulate: MXFE6 expires today (2026/05/20), MXFG6 is next month
+        expiring = MagicMock(delivery_date="2026/05/20", code="MXFE6")
+        next_month = MagicMock(delivery_date="2026/06/17", code="MXFG6")
+        adapter._api.Contracts.Futures.MXF = [expiring, next_month]
+
+        fake_today = dt.date(2026, 5, 20)
+        with patch("datetime.date") as mock_date:
+            mock_date.today.return_value = fake_today
+            mock_date.side_effect = lambda *a, **kw: dt.date(*a, **kw)
+            contract = adapter.get_contract("MXF")
+
+        assert contract.code == "MXFG6"
+
+    def test_get_contract_normal_day(self):
+        """On non-settlement day, near-month contract is returned normally."""
+        import datetime as dt
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+
+        adapter = object.__new__(ShioajiAdapter)
+        adapter._api = MagicMock()
+
+        near = MagicMock(delivery_date="2026/05/20", code="MXFE6")
+        far = MagicMock(delivery_date="2026/06/17", code="MXFG6")
+        adapter._api.Contracts.Futures.MXF = [near, far]
+
+        fake_today = dt.date(2026, 5, 19)
+        with patch("datetime.date") as mock_date:
+            mock_date.today.return_value = fake_today
+            mock_date.side_effect = lambda *a, **kw: dt.date(*a, **kw)
+            contract = adapter.get_contract("MXF")
+
+        assert contract.code == "MXFE6"

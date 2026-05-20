@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2.0  # seconds; doubles each attempt
+_MKT_ORDER_MAX_QTY = 10  # TAIFEX market-order cap per single order (小台/大台)
 
 
 class ExecutionError(RuntimeError):
@@ -312,7 +313,7 @@ class ShioajiAdapter:
 
         today_str = _dt.date.today().strftime("%Y/%m/%d")
 
-        valid = [c for c in contracts if c.delivery_date >= today_str]
+        valid = [c for c in contracts if c.delivery_date > today_str]
         if not valid:
             # Fallback: return the last available (most recent) contract
             valid = list(contracts)
@@ -417,6 +418,19 @@ class ShioajiAdapter:
         if price_type not in ("MKT", "LMT", "MKP"):
             raise ValueError(f"price_type must be MKT/LMT/MKP, got {price_type!r}")
 
+        # TAIFEX caps market orders at _MKT_ORDER_MAX_QTY per single order.
+        # Split into batches when needed; limit orders are uncapped.
+        if price_type in ("MKT", "MKP") and contracts > _MKT_ORDER_MAX_QTY:
+            return self._submit_batched(
+                product=product,
+                action=action,
+                contracts=contracts,
+                price_type=price_type,
+                price=price,
+                order_type=order_type,
+                octype=octype,
+            )
+
         fut_acct = self._futures_account()
         contract = self.get_contract(product)
 
@@ -449,6 +463,64 @@ class ShioajiAdapter:
         return {
             "order_id": status.id,
             "status": status.status.value,
+            "action": action,
+            "contracts": contracts,
+            "price_type": price_type,
+            "price": price,
+        }
+
+    def _submit_batched(
+        self,
+        product: str,
+        action: str,
+        contracts: int,
+        price_type: str,
+        price: float,
+        order_type: str,
+        octype: str,
+    ) -> dict:
+        """Split a large market order into batches of _MKT_ORDER_MAX_QTY.
+
+        Each batch is submitted sequentially with a 1-second interval.
+        Returns a merged result with comma-joined order IDs.
+        """
+        remaining = contracts
+        order_ids: list[str] = []
+        statuses: list[str] = []
+        batch_num = 0
+
+        while remaining > 0:
+            batch_qty = min(remaining, _MKT_ORDER_MAX_QTY)
+            batch_num += 1
+            logger.info(
+                "submit_order batch %d: %s %s %d/%d contracts @ %s",
+                batch_num,
+                action,
+                product,
+                batch_qty,
+                contracts,
+                price_type,
+            )
+
+            result = self.submit_order(
+                product=product,
+                action=action,
+                contracts=batch_qty,
+                price_type=price_type,
+                price=price,
+                order_type=order_type,
+                octype=octype,
+            )
+            order_ids.append(result["order_id"])
+            statuses.append(result["status"])
+            remaining -= batch_qty
+
+            if remaining > 0:
+                time.sleep(1)
+
+        return {
+            "order_id": ",".join(order_ids),
+            "status": statuses[-1],
             "action": action,
             "contracts": contracts,
             "price_type": price_type,
