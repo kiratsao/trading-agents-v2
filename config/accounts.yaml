@@ -30,9 +30,25 @@ accounts:
         contracts: 6
       - equity: 960000
         contracts: 7
+      - equity: 1080000
+        contracts: 8
+      - equity: 1200000
+        contracts: 9
+      - equity: 1320000
+        contracts: 10
+      - equity: 1440000
+        contracts: 11
+      - equity: 1560000
+        contracts: 12
+      - equity: 1680000
+        contracts: 13
+      - equity: 1800000
+        contracts: 14
+      - equity: 1920000
+        contracts: 15
 
     margin_per_contract: 131500   # TAIFEX 2026-04-27 調整
-    max_contracts: 11
+    max_contracts: 15
 
     sessions:
       day:
