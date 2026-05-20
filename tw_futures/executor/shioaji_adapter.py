@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2.0  # seconds; doubles each attempt
-_MKT_ORDER_MAX_QTY = 10  # TAIFEX market-order cap per single order (小台/大台)
+_MKT_ORDER_MAX_QTY = 5  # TAIFEX market-order cap per single MKT/IOC order (小台/大台實測)
 
 
 class ExecutionError(RuntimeError):

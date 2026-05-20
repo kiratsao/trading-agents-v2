@@ -140,20 +140,34 @@ class V2bOrchestrator:
         elif sig.action in ("close", "sell") and state.position > 0:
             closed_n = state.position
             is_settlement = "settlement" in sig.reason
+            sell_ok = True
             if broker is not None:
-                order = broker.place_order("MXF", "Sell", closed_n)
+                try:
+                    order = broker.place_order("MXF", "Sell", closed_n)
+                except Exception as exc:
+                    logger.error("Sell order failed: %s", exc)
+                    order = {"order_id": "FAILED", "status": "Failed"}
                 result["order_id"] = order.get("order_id")
-                exec_price = order.get("fill_price", float(df["close"].iloc[-1]))
-                _reconcile_position(broker, 0, self.notify_fn)
+                sell_status = order.get("status", "")
+                if sell_status in ("Failed", "Cancelled", "Inactive"):
+                    sell_ok = False
+                    msg = f"🔴 平倉失敗: Sell {closed_n}口 status={sell_status}"
+                    logger.error(msg)
+                    self.notify_fn(msg)
+                else:
+                    exec_price = order.get("fill_price", float(df["close"].iloc[-1]))
+                    _reconcile_position(broker, 0, self.notify_fn)
             else:
                 exec_price = float(df["close"].iloc[-1])
-            pnl_pts = exec_price - (state.entry_price or 0.0)
-            round_trip = COST_PER_SIDE * 2
-            pnl_twd = pnl_pts * closed_n * TICK_VALUE - round_trip * closed_n
-            state.equity += pnl_twd
-            result["exit_price"] = exec_price
-            result["pnl_twd"] = pnl_twd
-            _closed_contracts = closed_n
+
+            if sell_ok:
+                pnl_pts = exec_price - (state.entry_price or 0.0)
+                round_trip = COST_PER_SIDE * 2
+                pnl_twd = pnl_pts * closed_n * TICK_VALUE - round_trip * closed_n
+                state.equity += pnl_twd
+                result["exit_price"] = exec_price
+                result["pnl_twd"] = pnl_twd
+                _closed_contracts = closed_n
             # Reset position state
             state.position = 0
             state.entry_price = None
@@ -162,7 +176,8 @@ class V2bOrchestrator:
             state.pyramided = False
 
             # Settlement rollover: re-check entry immediately
-            if is_settlement:
+            # Only proceed if sell was successful
+            if is_settlement and sell_ok:
                 re_sig = self.strategy.generate_signal(
                     data=df,
                     current_position=0,
@@ -172,25 +187,52 @@ class V2bOrchestrator:
                     contracts=0,
                     tsmc_signal=tsmc_signal,
                 )
+                logger.info(
+                    "Settlement rollover: equity=%.0f → signal=%s contracts=%d reason=%s",
+                    state.equity, re_sig.action, re_sig.contracts, re_sig.reason,
+                )
                 if re_sig.action == "buy":
                     buy_n = re_sig.contracts
                     if broker is not None:
-                        buy_order = broker.place_order("MXF", "Buy", buy_n)
-                        buy_price = buy_order.get("fill_price", exec_price)
-                        _reconcile_position(broker, buy_n, self.notify_fn)
+                        try:
+                            buy_order = broker.place_order("MXF", "Buy", buy_n)
+                        except Exception as exc:
+                            logger.error("Rollover buy failed: %s", exc)
+                            buy_order = {"order_id": "FAILED", "status": "Failed"}
+                        buy_status = buy_order.get("status", "")
+                        if buy_status in ("Failed", "Cancelled", "Inactive"):
+                            msg = f"🔴 結算日轉倉買單失敗: Buy {buy_n}口 status={buy_status}"
+                            logger.error(msg)
+                            self.notify_fn(msg)
+                            result["rollover"] = False
+                            result["rollover_reason"] = f"buy order {buy_status}"
+                        else:
+                            buy_price = buy_order.get("fill_price", exec_price)
+                            _reconcile_position(broker, buy_n, self.notify_fn)
+                            state.equity -= COST_PER_SIDE * buy_n
+                            state.position = buy_n
+                            state.entry_price = buy_price
+                            state.contracts = buy_n
+                            state.highest_high = buy_price
+                            _action_contracts = buy_n
+                            result["rollover"] = True
+                            result["rollover_contracts"] = buy_n
                     else:
                         buy_price = exec_price
-                    state.equity -= COST_PER_SIDE * buy_n
-                    state.position = buy_n
-                    state.entry_price = buy_price
-                    state.contracts = buy_n
-                    state.highest_high = buy_price
-                    _action_contracts = buy_n
-                    result["rollover"] = True
-                    result["rollover_contracts"] = buy_n
+                        state.equity -= COST_PER_SIDE * buy_n
+                        state.position = buy_n
+                        state.entry_price = buy_price
+                        state.contracts = buy_n
+                        state.highest_high = buy_price
+                        _action_contracts = buy_n
+                        result["rollover"] = True
+                        result["rollover_contracts"] = buy_n
                 else:
                     result["rollover"] = False
                     result["rollover_reason"] = re_sig.reason
+            elif is_settlement and not sell_ok:
+                result["rollover"] = False
+                result["rollover_reason"] = "sell order failed — rollover aborted"
 
         elif sig.action == "add" and state.position > 0:
             add_n = sig.contracts
@@ -387,17 +429,31 @@ class V2bOrchestrator:
         elif state.pending_action == "close" and state.position > 0:
             closed_n = state.position
             is_settlement = "settlement" in (state.pending_reason or "")
+            sell_ok = True
             if broker is not None:
-                order = broker.place_order("MXF", "Sell", closed_n)
+                try:
+                    order = broker.place_order("MXF", "Sell", closed_n)
+                except Exception as exc:
+                    logger.error("Sell order failed: %s", exc)
+                    order = {"order_id": "FAILED", "status": "Failed"}
                 result["order_id"] = order.get("order_id")
-                exec_price = order.get("fill_price", exec_price)
-                _reconcile_position(broker, 0, self.notify_fn)
-            pnl_pts = exec_price - (state.entry_price or 0.0)
-            round_trip = COST_PER_SIDE * 2
-            pnl_twd = pnl_pts * closed_n * TICK_VALUE - round_trip * closed_n
-            state.equity += pnl_twd
-            result["exit_price"] = exec_price
-            result["pnl_twd"] = pnl_twd
+                sell_status = order.get("status", "")
+                if sell_status in ("Failed", "Cancelled", "Inactive"):
+                    sell_ok = False
+                    msg = f"🔴 結算日平倉失敗: Sell {closed_n}口 status={sell_status}"
+                    logger.error(msg)
+                    self.notify_fn(msg)
+                else:
+                    exec_price = order.get("fill_price", exec_price)
+                    _reconcile_position(broker, 0, self.notify_fn)
+
+            if sell_ok:
+                pnl_pts = exec_price - (state.entry_price or 0.0)
+                round_trip = COST_PER_SIDE * 2
+                pnl_twd = pnl_pts * closed_n * TICK_VALUE - round_trip * closed_n
+                state.equity += pnl_twd
+                result["exit_price"] = exec_price
+                result["pnl_twd"] = pnl_twd
             state.position = 0
             state.entry_price = None
             state.contracts = 0
@@ -405,7 +461,8 @@ class V2bOrchestrator:
             state.pyramided = False
 
             # ── Settlement rollover: re-check entry immediately ───
-            if is_settlement:
+            # Only proceed if sell was successful (not rejected by exchange)
+            if is_settlement and sell_ok:
                 df = self._load_data(broker=broker)
                 if df is not None and len(df) > 0:
                     re_sig = self.strategy.generate_signal(
@@ -416,25 +473,55 @@ class V2bOrchestrator:
                         highest_high=None,
                         contracts=0,
                         )
+                    logger.info(
+                        "Settlement rollover: equity=%.0f → signal=%s contracts=%d reason=%s",
+                        state.equity, re_sig.action, re_sig.contracts, re_sig.reason,
+                    )
                     if re_sig.action == "buy":
                         buy_n = re_sig.contracts
                         if broker is not None:
-                            buy_order = broker.place_order("MXF", "Buy", buy_n)
-                            buy_price = buy_order.get("fill_price", exec_price)
-                            _reconcile_position(broker, buy_n, self.notify_fn)
+                            try:
+                                buy_order = broker.place_order("MXF", "Buy", buy_n)
+                            except Exception as exc:
+                                logger.error("Rollover buy failed: %s", exc)
+                                buy_order = {"order_id": "FAILED", "status": "Failed"}
+                            buy_status = buy_order.get("status", "")
+                            if buy_status in ("Failed", "Cancelled", "Inactive"):
+                                msg = (
+                                    f"🔴 結算日轉倉買單失敗: Buy {buy_n}口 "
+                                    f"status={buy_status}"
+                                )
+                                logger.error(msg)
+                                self.notify_fn(msg)
+                                result["rollover"] = False
+                                result["rollover_reason"] = f"buy order {buy_status}"
+                            else:
+                                buy_price = buy_order.get("fill_price", exec_price)
+                                _reconcile_position(broker, buy_n, self.notify_fn)
+                                state.equity -= COST_PER_SIDE * buy_n
+                                state.position = buy_n
+                                state.entry_price = buy_price
+                                state.contracts = buy_n
+                                state.highest_high = buy_price
+                                result["rollover"] = True
+                                result["rollover_contracts"] = buy_n
+                                result["rollover_price"] = buy_price
                         else:
                             buy_price = exec_price
-                        state.equity -= COST_PER_SIDE * buy_n
-                        state.position = buy_n
-                        state.entry_price = buy_price
-                        state.contracts = buy_n
-                        state.highest_high = buy_price
-                        result["rollover"] = True
-                        result["rollover_contracts"] = buy_n
-                        result["rollover_price"] = buy_price
+                            state.equity -= COST_PER_SIDE * buy_n
+                            state.position = buy_n
+                            state.entry_price = buy_price
+                            state.contracts = buy_n
+                            state.highest_high = buy_price
+                            result["rollover"] = True
+                            result["rollover_contracts"] = buy_n
+                            result["rollover_price"] = buy_price
                     else:
                         result["rollover"] = False
                         result["rollover_reason"] = re_sig.reason
+            elif is_settlement and not sell_ok:
+                result["rollover"] = False
+                result["rollover_reason"] = "sell order failed — rollover aborted"
 
         elif state.pending_action == "add" and state.position > 0:
             add_n = state.pending_contracts

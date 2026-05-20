@@ -204,7 +204,7 @@ class TestRegressionParquetNotInGit:
 
 
 class TestRegressionMktOrderBatchSplit:
-    """Bug: Sell 13 口 MXF 被拒「超過市價單筆委託上限」— 小台市價上限 10 口。"""
+    """Bug: Sell 13 口 MXF 被拒「超過市價單筆委託上限」— 小台市價實測上限 5 口。"""
 
     def _make_adapter(self):
         """Create a ShioajiAdapter with mocked internals."""
@@ -220,8 +220,8 @@ class TestRegressionMktOrderBatchSplit:
         return adapter
 
     @patch("shioaji.Order", new_callable=lambda: MagicMock)
-    def test_submit_order_splits_over_10(self, mock_order_cls):
-        """Market order > 10 contracts must be split into batches."""
+    def test_submit_order_splits_over_5(self, mock_order_cls):
+        """Market order > 5 contracts must be split into batches of 5."""
         adapter = self._make_adapter()
 
         call_count = 0
@@ -238,14 +238,15 @@ class TestRegressionMktOrderBatchSplit:
 
         result = adapter.submit_order("MXF", "Sell", 13, price_type="MKT")
 
-        assert call_count == 2, f"Expected 2 batches, got {call_count}"
+        # 13 = 5 + 5 + 3 → 3 batches
+        assert call_count == 3, f"Expected 3 batches, got {call_count}"
         assert result["contracts"] == 13
         assert "ORD-1" in result["order_id"]
-        assert "ORD-2" in result["order_id"]
+        assert "ORD-3" in result["order_id"]
 
     @patch("shioaji.Order", new_callable=lambda: MagicMock)
     def test_submit_order_no_split_under_limit(self, mock_order_cls):
-        """Orders <= 10 contracts should NOT be split."""
+        """Orders <= 5 contracts should NOT be split."""
         adapter = self._make_adapter()
 
         trade = MagicMock()
@@ -253,10 +254,32 @@ class TestRegressionMktOrderBatchSplit:
         trade.status.status.value = "Filled"
         adapter._api.place_order.return_value = trade
 
-        result = adapter.submit_order("MXF", "Sell", 10, price_type="MKT")
+        result = adapter.submit_order("MXF", "Sell", 5, price_type="MKT")
 
         adapter._api.place_order.assert_called_once()
-        assert result["contracts"] == 10
+        assert result["contracts"] == 5
+
+    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    def test_6_contracts_splits_into_2_batches(self, mock_order_cls):
+        """6 contracts = 5 + 1 → 2 batches."""
+        adapter = self._make_adapter()
+
+        call_count = 0
+
+        def fake_place_order(contract, order):
+            nonlocal call_count
+            call_count += 1
+            trade = MagicMock()
+            trade.status.id = f"ORD-{call_count}"
+            trade.status.status.value = "Filled"
+            return trade
+
+        adapter._api.place_order = fake_place_order
+
+        result = adapter.submit_order("MXF", "Sell", 6, price_type="MKT")
+
+        assert call_count == 2
+        assert result["contracts"] == 6
 
     @patch("shioaji.Order", new_callable=lambda: MagicMock)
     def test_limit_order_not_split(self, mock_order_cls):
@@ -275,7 +298,7 @@ class TestRegressionMktOrderBatchSplit:
 
     @patch("shioaji.Order", new_callable=lambda: MagicMock)
     def test_split_exact_multiple(self, mock_order_cls):
-        """20 contracts = exactly 2 batches of 10, no remainder."""
+        """10 contracts = exactly 2 batches of 5, no remainder."""
         adapter = self._make_adapter()
 
         call_count = 0
@@ -290,10 +313,10 @@ class TestRegressionMktOrderBatchSplit:
 
         adapter._api.place_order = fake_place_order
 
-        result = adapter.submit_order("MXF", "Buy", 20, price_type="MKT")
+        result = adapter.submit_order("MXF", "Buy", 10, price_type="MKT")
 
         assert call_count == 2
-        assert result["contracts"] == 20
+        assert result["contracts"] == 10
 
 
 class TestRegressionSettlementDayContract:
@@ -302,6 +325,7 @@ class TestRegressionSettlementDayContract:
     def test_get_contract_excludes_today_expiry(self):
         """On settlement day, expiring contract (delivery_date == today) must be skipped."""
         import datetime as dt
+
         from tw_futures.executor.shioaji_adapter import ShioajiAdapter
 
         adapter = object.__new__(ShioajiAdapter)
@@ -323,6 +347,7 @@ class TestRegressionSettlementDayContract:
     def test_get_contract_normal_day(self):
         """On non-settlement day, near-month contract is returned normally."""
         import datetime as dt
+
         from tw_futures.executor.shioaji_adapter import ShioajiAdapter
 
         adapter = object.__new__(ShioajiAdapter)
@@ -339,3 +364,158 @@ class TestRegressionSettlementDayContract:
             contract = adapter.get_contract("MXF")
 
         assert contract.code == "MXFE6"
+
+
+class TestRegressionSellFailAbortsBuy:
+    """Bug: Sell 被拒但系統繼續執行 Buy 轉倉。"""
+
+    def test_sell_rejected_no_rollover_buy(self):
+        """If sell order fails, rollover buy must NOT execute."""
+        from src.scheduler.orchestrator import V2bOrchestrator
+        from src.state.state_manager import StateManager, TradingState
+
+        state_mgr = MagicMock(spec=StateManager)
+        state = TradingState(
+            position=13,
+            entry_price=20500.0,
+            contracts=13,
+            equity=1_200_000,
+            pending_action="close",
+            pending_contracts=13,
+            pending_reason="settlement-day force close",
+        )
+        state_mgr.load.return_value = state
+
+        broker = MagicMock()
+        # Sell returns Failed status (exchange rejected)
+        broker.place_order.return_value = {
+            "order_id": "REJECTED-1",
+            "status": "Failed",
+        }
+        broker.get_positions.return_value = []
+
+        notify_fn = MagicMock()
+        strategy = MagicMock()
+
+        orch = V2bOrchestrator(
+            strategy=strategy,
+            state_mgr=state_mgr,
+            notify_fn=notify_fn,
+            execution_timing="night_open",
+            live=False,
+        )
+
+        result = orch.run_execution(broker=broker, exec_price=22000.0)
+
+        # Sell was called once, but Buy must NOT be called
+        assert broker.place_order.call_count == 1
+        assert broker.place_order.call_args.args == ("MXF", "Sell", 13)
+
+        # Rollover must be aborted
+        assert result.get("rollover") is False
+        assert "sell order failed" in result.get("rollover_reason", "")
+
+        # LINE alert must contain 🔴
+        alert_msgs = [
+            call.args[0] for call in notify_fn.call_args_list
+            if "🔴" in call.args[0]
+        ]
+        assert len(alert_msgs) >= 1
+
+    def test_sell_exception_no_rollover_buy(self):
+        """If sell order raises exception, rollover buy must NOT execute."""
+        from src.scheduler.orchestrator import V2bOrchestrator
+        from src.state.state_manager import StateManager, TradingState
+
+        state_mgr = MagicMock(spec=StateManager)
+        state = TradingState(
+            position=7,
+            entry_price=21000.0,
+            contracts=7,
+            equity=900_000,
+            pending_action="close",
+            pending_contracts=7,
+            pending_reason="settlement-day force close",
+        )
+        state_mgr.load.return_value = state
+
+        broker = MagicMock()
+        broker.place_order.side_effect = Exception("超過市價單筆委託上限")
+        broker.get_positions.return_value = []
+
+        notify_fn = MagicMock()
+        strategy = MagicMock()
+
+        orch = V2bOrchestrator(
+            strategy=strategy,
+            state_mgr=state_mgr,
+            notify_fn=notify_fn,
+            execution_timing="night_open",
+            live=False,
+        )
+
+        result = orch.run_execution(broker=broker, exec_price=22000.0)
+
+        # Buy must NOT be called (sell raised exception)
+        assert broker.place_order.call_count == 1
+        assert result.get("rollover") is False
+
+    def test_sell_ok_then_buy_proceeds(self):
+        """If sell succeeds, rollover buy should proceed normally."""
+        import pandas as pd
+
+        from src.scheduler.orchestrator import V2bOrchestrator
+        from src.state.state_manager import StateManager, TradingState
+        from src.strategy.v2b_engine import Signal
+
+        state_mgr = MagicMock(spec=StateManager)
+        state = TradingState(
+            position=5,
+            entry_price=21000.0,
+            contracts=5,
+            equity=800_000,
+            pending_action="close",
+            pending_contracts=5,
+            pending_reason="settlement-day force close",
+        )
+        state_mgr.load.return_value = state
+
+        broker = MagicMock()
+        broker.place_order.return_value = {
+            "order_id": "OK-1",
+            "status": "Filled",
+            "fill_price": 22000.0,
+        }
+        broker.get_positions.return_value = [{"contracts": 5}]
+
+        notify_fn = MagicMock()
+
+        strategy = MagicMock()
+        strategy.generate_signal.return_value = Signal("buy", 4, "golden cross + ADX OK")
+
+        # Build minimal data for _load_data
+        dates = pd.bdate_range("2026-01-01", periods=200)
+        df = pd.DataFrame(
+            {"open": [22000]*200, "high": [22100]*200, "low": [21900]*200,
+             "close": [22000]*200, "volume": [100000]*200},
+            index=dates,
+        )
+
+        orch = V2bOrchestrator(
+            strategy=strategy,
+            state_mgr=state_mgr,
+            notify_fn=notify_fn,
+            execution_timing="night_open",
+            live=False,
+        )
+
+        with patch.object(orch, "_load_data", return_value=df):
+            result = orch.run_execution(broker=broker, exec_price=22000.0)
+
+        # Both sell and buy should be called
+        assert broker.place_order.call_count == 2
+        calls = broker.place_order.call_args_list
+        assert calls[0].args == ("MXF", "Sell", 5)
+        assert calls[1].args == ("MXF", "Buy", 4)
+        assert result.get("rollover") is True
+        assert result.get("rollover_contracts") == 4
