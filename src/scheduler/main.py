@@ -477,6 +477,38 @@ def main(argv=None) -> None:
             if b:
                 b.logout()
 
+    # 14:28 connection warm-up (pre-build broker to verify connectivity)
+    def _warmup_connection():
+        logger.info("14:28 連線預熱開始")
+        for attempt in range(1, 3):
+            try:
+                b = _build_broker(is_live)
+                if b is None:
+                    logger.info("14:28 warmup: simulation mode, no broker needed")
+                    return
+                contract = b.get_contract("MXF")
+                logger.info(
+                    "14:28 warmup OK: contract=%s (attempt %d)", contract.code, attempt
+                )
+                b.logout()
+                return
+            except Exception as exc:
+                logger.warning("14:28 warmup attempt %d failed: %s", attempt, exc)
+                if attempt >= 2:
+                    msg = f"🔴 14:28 連線預熱失敗（2次），14:30 信號可能失敗: {exc}"
+                    logger.error(msg)
+                    try:
+                        notify_fn(msg)
+                    except Exception:
+                        pass
+
+    scheduler.add_job(
+        func=_warmup_connection,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=14, minute=28),
+        id="v2b_warmup",
+        name="V2b 14:28 連線預熱",
+    )
+
     if orchestrator.execution_timing == "night_open":
         scheduler.add_job(
             func=_run_signal,
@@ -490,9 +522,26 @@ def main(argv=None) -> None:
             id="v2b_execution",
             name="V2b 15:05 夜盤下單",
         )
+
+        # 15:10 post-execution verification
+        def _post_verify():
+            try:
+                from scripts.post_execution_verify import run_verify
+
+                run_verify(skip_external=not is_live, notify_fn=notify_fn)
+            except Exception as exc:
+                logger.error("15:10 post-execution verify failed: %s", exc)
+
+        scheduler.add_job(
+            func=_post_verify,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=10),
+            id="v2b_post_verify",
+            name="V2b 15:10 執行後驗證",
+        )
+
         logger.info(
-            "Scheduler registered: 14:25 (data) + 14:30 (signal) + "
-            "15:05 (night execution) Asia/Taipei"
+            "Scheduler registered: 14:25 (data) + 14:28 (warmup) + "
+            "14:30 (signal) + 15:05 (execution) + 15:10 (verify) Asia/Taipei"
         )
     else:
         scheduler.add_job(
@@ -501,7 +550,26 @@ def main(argv=None) -> None:
             id="v2b_daily",
             name="V2b 14:30 每日執行",
         )
-        logger.info("Scheduler registered: 14:25 (data) + 14:30 Asia/Taipei")
+        logger.info(
+            "Scheduler registered: 14:25 (data) + 14:28 (warmup) + "
+            "14:30 Asia/Taipei"
+        )
+
+    # 20:00 pre-settlement check (runs every weekday, skips if not pre-settlement)
+    def _pre_settlement_check():
+        try:
+            from scripts.pre_settlement_check import run_check
+
+            run_check(skip_external=not is_live, notify_fn=notify_fn)
+        except Exception as exc:
+            logger.error("20:00 pre-settlement check failed: %s", exc)
+
+    scheduler.add_job(
+        func=_pre_settlement_check,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=20, minute=0),
+        id="v2b_pre_settlement",
+        name="V2b 20:00 結算日前檢查",
+    )
 
     logger.info("Press Ctrl+C to stop.")
     try:

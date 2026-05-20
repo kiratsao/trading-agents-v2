@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import asdict, dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_BACKUP_DIR = "data"
+_BACKUP_KEEP_DAYS = 7
 
 
 @dataclass
@@ -72,6 +77,57 @@ class StateManager:
             tmp.replace(self.path)
         except OSError as exc:
             logger.error("StateManager.save failed: %s", exc)
+            return
+        # Daily backup (one per day, keep last _BACKUP_KEEP_DAYS)
+        self._backup_daily()
+
+    def _backup_daily(self) -> None:
+        """Copy state to data/state_backup_{date}.json, prune old backups."""
+        if not self.path.exists():
+            return
+        backup_dir = Path(_BACKUP_DIR)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        today_str = date.today().strftime("%Y-%m-%d")
+        backup_path = backup_dir / f"state_backup_{today_str}.json"
+        try:
+            shutil.copy2(self.path, backup_path)
+        except OSError as exc:
+            logger.warning("State backup failed: %s", exc)
+            return
+        # Prune old backups
+        for old in sorted(backup_dir.glob("state_backup_*.json")):
+            if old == backup_path:
+                continue
+            try:
+                # Extract date from filename
+                date_part = old.stem.replace("state_backup_", "")
+                backup_date = date.fromisoformat(date_part)
+                if (date.today() - backup_date).days > _BACKUP_KEEP_DAYS:
+                    old.unlink()
+                    logger.debug("Pruned old state backup: %s", old.name)
+            except (ValueError, OSError):
+                pass
+
+    @staticmethod
+    def restore_from_backup(backup_path: str | Path, target_path: str | Path) -> bool:
+        """Restore state from a backup file. Returns True if successful."""
+        backup = Path(backup_path)
+        target = Path(target_path)
+        if not backup.exists():
+            logger.error("Backup file not found: %s", backup)
+            return False
+        try:
+            # Validate backup is valid JSON with state key
+            raw = json.loads(backup.read_text(encoding="utf-8"))
+            if "state" not in raw:
+                logger.error("Backup file missing 'state' key: %s", backup)
+                return False
+            shutil.copy2(backup, target)
+            logger.info("State restored from backup: %s → %s", backup, target)
+            return True
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error("Restore from backup failed: %s", exc)
+            return False
 
     def append_trade(self, trade: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

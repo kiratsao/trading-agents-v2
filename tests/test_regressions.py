@@ -519,3 +519,167 @@ class TestRegressionSellFailAbortsBuy:
         assert calls[1].args == ("MXF", "Buy", 4)
         assert result.get("rollover") is True
         assert result.get("rollover_contracts") == 4
+
+
+class TestRegressionSettlementBatchOrder:
+    """13 口 → 分批 5+5+3（結算日場景完整測試）。"""
+
+    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    def test_13_contracts_split_5_5_3(self, mock_order_cls):
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+
+        adapter = object.__new__(ShioajiAdapter)
+        adapter._api = MagicMock()
+        adapter._api.Contracts.Futures.MXF = [
+            MagicMock(delivery_date="2099/12/31", code="MXFZ9"),
+        ]
+        adapter._api.futopt_account = MagicMock()
+        adapter._accounts = []
+
+        batch_sizes = []
+
+        def fake_place_order(contract, order):
+            batch_sizes.append(order.quantity)
+            trade = MagicMock()
+            trade.status.id = f"ORD-{len(batch_sizes)}"
+            trade.status.status.value = "Filled"
+            return trade
+
+        adapter._api.place_order = fake_place_order
+        mock_order_cls.side_effect = lambda **kw: MagicMock(quantity=kw["quantity"])
+
+        result = adapter.submit_order("MXF", "Sell", 13, price_type="MKT")
+
+        assert batch_sizes == [5, 5, 3]
+        assert result["contracts"] == 13
+
+
+class TestRegressionSettlementRolloverContract:
+    """結算日轉倉使用下月合約，不用已到期合約。"""
+
+    def test_rollover_uses_next_month(self):
+        import datetime as dt
+
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+
+        adapter = object.__new__(ShioajiAdapter)
+        adapter._api = MagicMock()
+
+        # Settlement day: MXFE6 expires today
+        expiring = MagicMock(delivery_date="2026/06/17", code="MXFE6")
+        next_month = MagicMock(delivery_date="2026/07/15", code="MXFG6")
+        adapter._api.Contracts.Futures.MXF = [expiring, next_month]
+
+        fake_today = dt.date(2026, 6, 17)
+        with patch("datetime.date") as mock_date:
+            mock_date.today.return_value = fake_today
+            mock_date.side_effect = lambda *a, **kw: dt.date(*a, **kw)
+            contract = adapter.get_contract("MXF")
+
+        assert contract.code == "MXFG6", f"Should use next month, got {contract.code}"
+
+
+class TestRegressionLadderCoversEquity:
+    """當前 equity 必須在 ladder 範圍內。"""
+
+    def test_ladder_covers_1730k(self):
+        from src.strategy.v2b_engine import _anti_martingale_contracts
+
+        ladder = [
+            {"equity": 350000, "contracts": 2},
+            {"equity": 480000, "contracts": 3},
+            {"equity": 600000, "contracts": 4},
+            {"equity": 720000, "contracts": 5},
+            {"equity": 840000, "contracts": 6},
+            {"equity": 960000, "contracts": 7},
+            {"equity": 1080000, "contracts": 8},
+            {"equity": 1200000, "contracts": 9},
+            {"equity": 1320000, "contracts": 10},
+            {"equity": 1440000, "contracts": 11},
+            {"equity": 1560000, "contracts": 12},
+            {"equity": 1680000, "contracts": 13},
+            {"equity": 1800000, "contracts": 14},
+            {"equity": 1920000, "contracts": 15},
+        ]
+        n = _anti_martingale_contracts(1_730_000, ladder, 15, 131_500)
+        assert n == 13, f"Expected 13 contracts for 1.73M equity, got {n}"
+
+    def test_config_ladder_matches_code(self):
+        """accounts.yaml ladder must cover at least 1.5M equity."""
+        import re
+
+        content = Path("config/accounts.yaml").read_text()
+        # Extract all equity values from scale_ladder
+        equities = [int(m) for m in re.findall(r"equity:\s*(\d+)", content)]
+        assert max(equities) >= 1_500_000, f"Ladder max {max(equities)} too low"
+        # Extract max_contracts
+        max_c = re.search(r"max_contracts:\s*(\d+)", content)
+        assert max_c and int(max_c.group(1)) >= 13, "max_contracts must be >= 13"
+
+
+class TestRegressionStateBackup:
+    """State 備份機制：每次 save 備份 + 保留 7 天 + 可恢復。"""
+
+    def test_save_creates_backup(self, tmp_path):
+        from src.state.state_manager import StateManager, TradingState
+
+        state_path = tmp_path / "state.json"
+        mgr = StateManager(path=str(state_path))
+
+        with patch("src.state.state_manager._BACKUP_DIR", str(tmp_path)):
+            mgr.save(TradingState(position=5, equity=800_000))
+
+        backups = list(tmp_path.glob("state_backup_*.json"))
+        assert len(backups) == 1
+        # Verify backup content
+        import json
+
+        data = json.loads(backups[0].read_text())
+        assert data["state"]["position"] == 5
+
+    def test_backup_prunes_old(self, tmp_path):
+        import json
+        from datetime import timedelta
+
+        from src.state.state_manager import StateManager, TradingState
+
+        state_path = tmp_path / "state.json"
+        mgr = StateManager(path=str(state_path))
+
+        # Create fake old backups
+        today = __import__("datetime").date.today()
+        for i in range(10):
+            old_date = today - timedelta(days=i + 5)
+            old_backup = tmp_path / f"state_backup_{old_date.isoformat()}.json"
+            old_backup.write_text(json.dumps({"state": {}}))
+
+        with patch("src.state.state_manager._BACKUP_DIR", str(tmp_path)):
+            mgr.save(TradingState(position=1, equity=350_000))
+
+        backups = list(tmp_path.glob("state_backup_*.json"))
+        # Should have pruned backups older than 7 days
+        # Today's + within 7 days should remain
+        for b in backups:
+            date_part = b.stem.replace("state_backup_", "")
+            d = __import__("datetime").date.fromisoformat(date_part)
+            assert (today - d).days <= 7, f"Backup {b.name} should have been pruned"
+
+    def test_restore_from_backup(self, tmp_path):
+        import json
+
+        from src.state.state_manager import StateManager
+
+        # Create a backup
+        backup = tmp_path / "state_backup_2026-05-20.json"
+        backup.write_text(json.dumps({
+            "state": {"position": 13, "equity": 1730000.0},
+            "trades": [],
+        }))
+
+        target = tmp_path / "state.json"
+        ok = StateManager.restore_from_backup(str(backup), str(target))
+        assert ok is True
+        assert target.exists()
+
+        data = json.loads(target.read_text())
+        assert data["state"]["position"] == 13
