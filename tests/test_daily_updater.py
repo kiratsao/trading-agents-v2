@@ -419,3 +419,101 @@ class TestGapDetection:
         # Parquet already at yesterday → already-up-to-date branch, no
         # main fetch; window is contiguous → no back-fill probes.
         assert m.call_count == 0
+
+
+class TestShioajiFetchEndDate:
+    """Regression for the 14:25 data-contamination bug: the previous
+    `end_plus = end + 1 day` pulled today's intra-session bar through
+    Shioaji's INCLUSIVE end, then aggregated it as the day-session close.
+    These tests pin both the `end` arg passed to Shioaji AND the
+    post-aggregation `> yesterday` cutoff filter."""
+
+    def _fake_adapter_module(self, kbars_obj):
+        """Build a stand-in shioaji_adapter module that records the
+        kbars(end=...) argument and returns kbars_obj."""
+        captured = {}
+
+        class _FakeKbarsApi:
+            def kbars(self, contract, start, end, timeout):
+                captured["start"] = start
+                captured["end"] = end
+                return kbars_obj
+
+        class _FakeAdapter:
+            def __init__(self, *args, **kwargs): self._api = _FakeKbarsApi()
+            def get_contract(self, product): return object()
+            def logout(self): pass
+
+        return _FakeAdapter, captured
+
+    def _make_kbars(self, ts_list, prices):
+        """Build a duck-typed kbars-like object out of two parallel lists."""
+        class _K:
+            ts = [int(pd.Timestamp(t, tz="Asia/Taipei").tz_convert("UTC").value)
+                  for t in ts_list]
+            Open = list(prices)
+            High = list(prices)
+            Low = list(prices)
+            Close = list(prices)
+            Volume = [100] * len(prices)
+        return _K()
+
+    def test_end_date_is_yesterday_only(self):
+        """The kbars call's `end` argument must equal yesterday, NOT
+        yesterday+1 (today). yesterday=2026-04-08."""
+        from src.data import daily_updater as du
+
+        FakeAdapter, captured = self._fake_adapter_module(
+            self._make_kbars(
+                ["2026-04-08 13:00:00"], [21000.0],
+            )
+        )
+        with (
+            patch.dict("os.environ", {
+                "SHIOAJI_API_KEY": "k", "SHIOAJI_SECRET_KEY": "s",
+            }, clear=False),
+            patch("tw_futures.executor.shioaji_adapter.ShioajiAdapter",
+                  FakeAdapter),
+        ):
+            du._fetch_and_aggregate(date(2026, 4, 8), date(2026, 4, 8))
+
+        assert captured["end"] == "2026-04-08", (
+            f"end must be yesterday (2026-04-08), got {captured['end']!r}; "
+            "leaking today's intra-session bar was the data-contamination bug"
+        )
+
+    def test_fetch_does_not_include_today(self):
+        """Even if Shioaji leaks bars dated past `end` (today / future),
+        the post-aggregation filter must drop them. yesterday=2026-04-08;
+        Shioaji is forced to return both 2026-04-08 (good) and
+        2026-04-09 (today, must be filtered out)."""
+        from src.data import daily_updater as du
+
+        FakeAdapter, _ = self._fake_adapter_module(
+            self._make_kbars(
+                [
+                    "2026-04-08 09:00:00",  # yesterday day-session open
+                    "2026-04-08 13:00:00",  # yesterday day-session close
+                    "2026-04-09 09:00:00",  # TODAY -- must be dropped
+                    "2026-04-09 13:00:00",
+                ],
+                [21000.0, 21100.0, 19800.0, 19850.0],
+            )
+        )
+        with (
+            patch.dict("os.environ", {
+                "SHIOAJI_API_KEY": "k", "SHIOAJI_SECRET_KEY": "s",
+            }, clear=False),
+            patch("tw_futures.executor.shioaji_adapter.ShioajiAdapter",
+                  FakeAdapter),
+        ):
+            df = du._fetch_and_aggregate(date(2026, 4, 8), date(2026, 4, 8))
+
+        assert df is not None and not df.empty
+        idx_dates = [t.date() for t in df.index]
+        assert date(2026, 4, 9) not in idx_dates, (
+            f"today's bar (2026-04-09) leaked through aggregation: {idx_dates}"
+        )
+        assert date(2026, 4, 8) in idx_dates, (
+            "yesterday's bar must still be returned"
+        )

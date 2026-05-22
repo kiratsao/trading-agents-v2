@@ -345,11 +345,18 @@ def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
 
     try:
         contract = adapter.get_contract("MXF")
-        end_plus = pd.Timestamp(end) + pd.Timedelta(days=1)
+        # `end` is the LAST completed trading day (yesterday at 14:25 cron
+        # time). Empirically Shioaji's `end` is INCLUSIVE, so the previous
+        # `end_plus = end + 1 day` query pulled today's still-evolving day
+        # session bar. At 14:25 the day session has just closed (13:44) but
+        # the settlement close hasn't published yet, so today's intra-day
+        # last-tick mis-represented the official close by up to ~1,300pt.
+        # Operators verifying the API semantics can run the probe script at
+        # scripts/probe_shioaji_kbars_end_semantics.py before changing this.
         kbars = adapter._api.kbars(
             contract,
             start=str(start),
-            end=str(end_plus.date()),
+            end=str(end),
             timeout=30_000,
         )
     finally:
@@ -398,6 +405,20 @@ def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
         volume=("volume", "sum"),
     )
     daily.index = pd.DatetimeIndex(daily.index, name="date")
+    # Defense-in-depth: even if the upstream `end` argument leaks a future
+    # API change or someone re-introduces +1, any bar strictly newer than
+    # the requested end (= last completed trading day) MUST be dropped.
+    # A 14:25 query that surfaces today's still-evolving bar is the exact
+    # bug that contaminated the parquet by ~1,300pt.
+    cutoff = pd.Timestamp(end)
+    bad = daily.index > cutoff
+    if bad.any():
+        dropped = [str(d.date()) for d in daily.index[bad]]
+        logger.warning(
+            "daily_updater: dropping %d bar(s) newer than end=%s: %s",
+            int(bad.sum()), end, dropped,
+        )
+        daily = daily[~bad]
     return daily
 
 
