@@ -53,9 +53,67 @@ def _send_line(msg: str) -> None:
         logger.warning("LINE alert failed: %s", exc)
 
 
+def _refresh_state_equity_from_broker() -> str:
+    """08:00 hook: read live equity from Shioaji and cache it into
+    ``data/paper_state.json`` so downstream consumers (sizing, the
+    health-check report below) don't drift on stale values.
+
+    No-ops cleanly when credentials / network are unavailable; the
+    existing cached value is preserved on every failure mode.
+    Returns a one-line summary for the health-check report."""
+    if not _STATE.exists():
+        return ""
+    api_key = os.environ.get("SHIOAJI_API_KEY", "")
+    secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        return "equity refresh skipped (no Shioaji credentials)"
+
+    try:
+        from src.scheduler.orchestrator import _persist_live_equity
+        from src.state.state_manager import StateManager
+        from tw_futures.executor.shioaji_adapter import ShioajiAdapter
+    except Exception as exc:
+        logger.warning("equity-refresh import failed: %s", exc)
+        return ""
+
+    state_mgr = StateManager(path=str(_STATE))
+    state = state_mgr.load()
+
+    broker = None
+    try:
+        broker = ShioajiAdapter(
+            api_key=api_key,
+            secret_key=secret_key,
+            simulation=False,
+            cert_path=os.environ.get("SHIOAJI_CERT_PATH") or None,
+            cert_password=os.environ.get("SHIOAJI_CERT_PASSWORD") or None,
+            person_id=os.environ.get("SHIOAJI_PERSON_ID") or None,
+        )
+        equity, src = _persist_live_equity(broker, state, state_mgr)
+    except Exception as exc:
+        logger.warning("equity-refresh broker step failed: %s", exc)
+        return "equity refresh failed (read error)"
+    finally:
+        if broker is not None:
+            try:
+                broker.logout()
+            except Exception:
+                pass
+
+    if src == "即時":
+        return f"equity refreshed: {equity:,.0f} (live)"
+    return "equity refresh: read failed, cached value preserved"
+
+
 def main():
     issues = []
     today = pd.Timestamp.now(tz="Asia/Taipei").date()
+
+    # 0. Refresh state.equity from live broker BEFORE reading state below,
+    # so the report reflects the most recent margin balance.
+    refresh_summary = _refresh_state_equity_from_broker()
+    if refresh_summary:
+        logger.info(refresh_summary)
 
     # 1. Parquet freshness
     if _DATA.exists():

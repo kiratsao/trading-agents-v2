@@ -295,7 +295,8 @@ class V2bOrchestrator:
             logger.warning("Data freshness check: %s", freshness)
 
         state = self.state_mgr.load()
-        equity, equity_src = _query_live_equity(broker, state.equity)
+        # Cache the latest live equity into state when broker can serve it.
+        equity, equity_src = _persist_live_equity(broker, state, self.state_mgr)
         display_ind = self._compute_display_indicators(df, state)
 
         sig = self.strategy.generate_signal(
@@ -384,6 +385,10 @@ class V2bOrchestrator:
                 logger.error("run_execution: live=True but SHIOAJI credentials missing")
 
         state = self.state_mgr.load()
+        # Cache the latest live equity into state when broker can serve it.
+        # Runs BEFORE any pending-action branch so even a "hold" cycle
+        # refreshes the cached equity snapshot.
+        _persist_live_equity(broker, state, self.state_mgr)
 
         # No pending action or explicit hold
         if (not state.pending_action) or state.pending_action == "hold":
@@ -542,6 +547,12 @@ class V2bOrchestrator:
         state.pending_contracts = 0
         state.pending_reason = None
         self.state_mgr.save(state)
+
+        # Post-execution verify (15:10 hook): the order has filled and
+        # _reconcile_position has run. Re-read live equity now so
+        # state.equity reflects the post-fill margin balance rather
+        # than the cost+pnl bookkeeping estimate.
+        _persist_live_equity(broker, state, self.state_mgr)
 
         # LINE execution notification
         tz_cst = timezone(timedelta(hours=8))
@@ -977,6 +988,24 @@ def _query_live_equity(broker, fallback_equity: float) -> tuple[float, str]:
         logger.warning("get_account() failed: %s — using state estimate", exc)
 
     return fallback_equity, "估算"
+
+
+def _persist_live_equity(broker, state: TradingState, state_mgr) -> tuple[float, str]:
+    """Read live equity AND cache it in state when the read succeeds.
+
+    Stale value is preserved when the broker is unavailable or returns 0
+    -- callers see (state.equity, "估算") in that case. Used by every
+    entry point that already holds a broker handle (run_signal,
+    run_execution start, post-execution verify, daily_health_check) so
+    the on-disk state.equity is always the most recent successful real-
+    time snapshot rather than the strategy's bookkeeping estimate.
+    """
+    equity, src = _query_live_equity(broker, state.equity)
+    if src == "即時" and equity > 0:
+        state.equity = equity
+        state_mgr.save(state)
+        logger.info("state.equity updated from live broker read: %.0f", equity)
+    return equity, src
 
 
 def _reconcile_position(broker, expected_contracts: int, notify_fn) -> None:

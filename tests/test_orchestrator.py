@@ -113,3 +113,87 @@ class TestRunDailyAdd:
 
         assert result["action"] == "add"
         broker.place_order.assert_called_once_with("MXF", "Buy", 1)
+
+
+class TestEquityAutoUpdate:
+    """Successful live-equity reads must write through to state on disk;
+    failures must leave the cached value alone."""
+
+    def _build_night_orch(self, state, signal_override):
+        strategy = V2bEngine(
+            product="MXF", ema_fast=30, ema_slow=100,
+            confirm_days=2, adx_threshold=25,
+        )
+        strategy.generate_signal = lambda *a, **kw: signal_override
+        state_mgr = MagicMock(spec=StateManager)
+        state_mgr.load.return_value = state
+        orch = V2bOrchestrator(
+            strategy=strategy, state_mgr=state_mgr,
+            notify_fn=MagicMock(),
+            execution_timing="night_open", live=False,
+        )
+        return orch, state_mgr
+
+    def test_equity_auto_update_on_signal(self):
+        """Broker returns live equity > 0 → state.equity updated AND
+        state_mgr.save called with the new value."""
+        state = TradingState(position=0, equity=500_000.0)
+        sig = Signal("hold", 0, "no entry")
+        orch, state_mgr = self._build_night_orch(state, sig)
+
+        broker = MagicMock()
+        broker.get_account.return_value = {"equity": 612_345.0}
+
+        df = _make_data()
+        with patch.object(orch, "_load_data", return_value=df):
+            orch.run_signal(broker=broker)
+
+        broker.get_account.assert_called()
+        assert state.equity == 612_345.0, (
+            "live equity must be persisted into state.equity"
+        )
+        saved_equities = [
+            call.args[0].equity for call in state_mgr.save.call_args_list
+        ]
+        assert 612_345.0 in saved_equities
+
+    def test_equity_auto_update_fallback(self):
+        """Broker.get_account raises → state.equity is NOT overwritten
+        (the previous cached value is preserved)."""
+        state = TradingState(position=0, equity=480_000.0)
+        sig = Signal("hold", 0, "no entry")
+        orch, state_mgr = self._build_night_orch(state, sig)
+
+        broker = MagicMock()
+        broker.get_account.side_effect = ConnectionError("api down")
+
+        df = _make_data()
+        with patch.object(orch, "_load_data", return_value=df):
+            orch.run_signal(broker=broker)
+
+        broker.get_account.assert_called()
+        assert state.equity == 480_000.0, (
+            "broker failure must not overwrite cached equity"
+        )
+
+    def test_equity_auto_update_on_execution(self):
+        """run_execution also persists live equity (covers the
+        15:05 entry + post-fill verify combined path)."""
+        state = TradingState(
+            position=0, equity=500_000.0,
+            pending_action=None, pending_contracts=0,
+        )
+        sig = Signal("hold", 0, "no entry")
+        orch, state_mgr = self._build_night_orch(state, sig)
+
+        broker = MagicMock()
+        broker.get_account.return_value = {"equity": 730_000.0}
+
+        orch.run_execution(broker=broker, exec_price=21000.0)
+
+        broker.get_account.assert_called()
+        assert state.equity == 730_000.0
+        saved_equities = [
+            call.args[0].equity for call in state_mgr.save.call_args_list
+        ]
+        assert 730_000.0 in saved_equities

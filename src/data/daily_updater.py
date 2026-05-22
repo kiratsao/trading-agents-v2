@@ -36,6 +36,13 @@ _DAY_OPEN = time(8, 45)
 _DAY_CLOSE = time(13, 45)
 _SETTLE_CLOSE = time(13, 30)  # settlement day regular session ends 13:30
 
+# Number of recent trading days to re-scan after each update. Anything
+# missing inside this window (per TAIFEX calendar) triggers a back-fill
+# attempt and, on failure, a LINE alert so the operator can intervene.
+# Keep this modest: a wider window risks many Shioaji round trips against
+# old dates the operator has already accepted as lost.
+_GAP_SCAN_LOOKBACK_DAYS = 10
+
 
 def update(
     parquet_path: Path | None = None,
@@ -75,11 +82,18 @@ def update(
 
     if fetch_start > yesterday:
         logger.info("daily_updater: already up-to-date (last=%s)", last_date)
+        # Tail-already-current doesn't mean the whole look-back window is
+        # whole. A missed cron 5 days ago could still leave that day
+        # absent; run the scan unconditionally.
+        gaps_filled, still_missing = _detect_and_fill_gaps(
+            df, parquet_path, _notify, yesterday,
+        )
         return {
-            "success": True,
+            "success": not still_missing,
             "bars_added": 0,
+            "gaps_filled": gaps_filled,
             "latest_date": str(last_date),
-            "error": None,
+            "error": None if not still_missing else f"unfilled gaps: {still_missing}",
         }
 
     # 3. Fetch kbars from Shioaji (only up to yesterday)
@@ -96,6 +110,7 @@ def update(
         return {
             "success": False,
             "bars_added": 0,
+            "gaps_filled": 0,
             "latest_date": str(last_date),
             "error": err,
         }
@@ -112,15 +127,20 @@ def update(
             return {
                 "success": False,
                 "bars_added": 0,
+                "gaps_filled": 0,
                 "latest_date": str(last_date),
                 "error": warn,
             }
         logger.info("daily_updater: no new bars (last=%s, yesterday=%s)", last_date, yesterday)
+        gaps_filled, still_missing = _detect_and_fill_gaps(
+            df, parquet_path, _notify, yesterday,
+        )
         return {
-            "success": True,
+            "success": not still_missing,
             "bars_added": 0,
+            "gaps_filled": gaps_filled,
             "latest_date": str(last_date),
-            "error": None,
+            "error": None if not still_missing else f"unfilled gaps: {still_missing}",
         }
 
     # 4. Filter weekends + TAIFEX holidays
@@ -136,6 +156,7 @@ def update(
         return {
             "success": True,
             "bars_added": 0,
+            "gaps_filled": 0,
             "latest_date": str(last_date),
             "error": None,
         }
@@ -147,6 +168,7 @@ def update(
         return {
             "success": True,
             "bars_added": 0,
+            "gaps_filled": 0,
             "latest_date": str(last_date),
             "error": None,
         }
@@ -176,11 +198,20 @@ def update(
         logger.info(msg)
         _notify(msg)
 
+    # 8. Re-scan the recent look-back window. Even after a successful tail
+    # append, an older day inside the window can still be missing (e.g. an
+    # earlier 14:25 cron silently produced 0 bars). One unnoticed gap
+    # surfaces later as silent backtest divergence -- worth the extra scan.
+    gaps_filled, still_missing = _detect_and_fill_gaps(
+        df, parquet_path, _notify, yesterday,
+    )
+
     return {
-        "success": True,
+        "success": not still_missing,
         "bars_added": n_new,
+        "gaps_filled": gaps_filled,
         "latest_date": str(new_last),
-        "error": None,
+        "error": None if not still_missing else f"unfilled gaps: {still_missing}",
     }
 
 
@@ -192,6 +223,98 @@ def _last_trading_day(ref: date) -> date:
     from src.data.tw_holidays import last_trading_day_before
 
     return last_trading_day_before(ref)
+
+
+def _trading_days_in_window(end: date, n_days: int) -> list[date]:
+    """Return up to *n_days* most recent TAIFEX trading days <= *end*
+    (inclusive), oldest first. Uses tw_holidays.is_trading_day so weekends
+    AND TAIFEX holidays are skipped."""
+    from src.data.tw_holidays import is_trading_day
+
+    out: list[date] = []
+    cur = end
+    while len(out) < n_days and cur >= date(2020, 1, 1):
+        if is_trading_day(cur):
+            out.append(cur)
+        cur -= timedelta(days=1)
+    return list(reversed(out))
+
+
+def _detect_and_fill_gaps(
+    df: pd.DataFrame,
+    parquet_path: Path,
+    notify_fn: Callable[[str], Any],
+    yesterday: date,
+    *,
+    _fetch_override: Callable[[date, date], pd.DataFrame | None] | None = None,
+) -> tuple[int, list[date]]:
+    """Scan the last N trading days for missing bars and try to back-fill.
+
+    Returns ``(gaps_filled, still_missing)``. The parquet on disk is
+    rewritten in-place after every successful back-fill so a later loop
+    failure doesn't lose earlier successes. Each remaining gap emits a
+    LINE alert with the date so the operator can investigate manually.
+
+    ``_fetch_override`` is a testing seam -- production callers leave it
+    None and the real Shioaji fetcher is used.
+    """
+    window = _trading_days_in_window(yesterday, _GAP_SCAN_LOOKBACK_DAYS)
+    if not window:
+        return 0, []
+
+    existing = {ts.date() for ts in pd.DatetimeIndex(df.index).normalize()}
+    missing = [d for d in window if d not in existing]
+    if not missing:
+        return 0, []
+
+    logger.info(
+        "daily_updater: gap scan found %d missing day(s) in last %d trading days: %s",
+        len(missing), _GAP_SCAN_LOOKBACK_DAYS,
+        [d.isoformat() for d in missing],
+    )
+
+    fetcher = _fetch_override if _fetch_override is not None else _fetch_and_aggregate
+
+    filled = 0
+    still_missing: list[date] = []
+    for d in missing:
+        bar: pd.DataFrame | None
+        try:
+            bar = fetcher(d, d)
+        except Exception as exc:
+            logger.warning("daily_updater: back-fill fetch for %s raised: %s", d, exc)
+            bar = None
+
+        if bar is None or bar.empty:
+            still_missing.append(d)
+            warn = f"⚠️ {d.isoformat()} 資料缺失，需手動處理 (自動補回失敗)"
+            logger.warning(warn)
+            notify_fn(warn)
+            continue
+
+        # Filter out weekends + anything already present.
+        bar = bar[bar.index.dayofweek < 5]
+        if bar.empty:
+            still_missing.append(d)
+            continue
+        existing_dates = {ts.date() for ts in pd.DatetimeIndex(df.index).normalize()}
+        bar = bar[~bar.index.normalize().isin(
+            pd.DatetimeIndex([pd.Timestamp(x) for x in existing_dates])
+        )]
+        if bar.empty:
+            # Already present after a prior loop iteration -- nothing more
+            # to do, and definitely no alert.
+            continue
+
+        df = pd.concat([df, bar]).sort_index()
+        df.index = pd.to_datetime(df.index)
+        df.index.name = "date"
+        df.to_parquet(parquet_path, index=True)
+        filled += 1
+        logger.info("daily_updater: back-filled %s", d)
+        notify_fn(f"✅ {d.isoformat()} 資料補回成功")
+
+    return filled, still_missing
 
 
 def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
