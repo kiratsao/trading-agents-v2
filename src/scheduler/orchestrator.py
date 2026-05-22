@@ -243,12 +243,19 @@ class V2bOrchestrator:
                 _reconcile_position(broker, state.position + add_n, self.notify_fn)
             else:
                 exec_price = float(df["close"].iloc[-1])
+            # Update the cost basis BEFORE state.position is mutated: the
+            # helper uses the pre-add position size as old_n for the
+            # weighted-average calc / broker-size sanity check.
+            new_entry, entry_src = _reconcile_add_entry_price(
+                broker, "MXF", state, add_n, exec_price,
+            )
             state.equity -= COST_PER_SIDE * add_n
             state.position += add_n
             state.contracts = state.position
             state.pyramided = True
             result["add_contracts"] = add_n
-            result["entry_price"] = exec_price
+            result["entry_price"] = new_entry
+            result["entry_price_source"] = entry_src
             _action_contracts = add_n
 
         elif sig.action == "hold" and state.position > 0:
@@ -535,11 +542,18 @@ class V2bOrchestrator:
                 result["order_id"] = order.get("order_id")
                 exec_price = order.get("fill_price", exec_price)
                 _reconcile_position(broker, state.position + add_n, self.notify_fn)
+            # Update the cost basis BEFORE mutating state.position: the
+            # helper needs the pre-add size as old_n.
+            new_entry, entry_src = _reconcile_add_entry_price(
+                broker, "MXF", state, add_n, exec_price,
+            )
             state.equity -= COST_PER_SIDE * add_n
             state.position += add_n
             state.contracts = state.position
             state.pyramided = True
             result["add_contracts"] = add_n
+            result["entry_price"] = new_entry
+            result["entry_price_source"] = entry_src
 
         # Clear pending
         state.pending_action = None
@@ -988,6 +1002,101 @@ def _query_live_equity(broker, fallback_equity: float) -> tuple[float, str]:
         logger.warning("get_account() failed: %s — using state estimate", exc)
 
     return fallback_equity, "估算"
+
+
+def _query_broker_avg_price(broker, product: str, expected_contracts: int) -> float | None:
+    """Read the broker's weighted-average entry price for *product* after
+    a fill. Returns the value when the position size matches the expected
+    contract count (sanity check). Returns None on any failure / mismatch
+    so callers can fall back to a local weighted-average computation.
+
+    Used by the Anti-Martingale add path: after pyramiding, the broker's
+    book carries the true blended cost basis. Without writing it back
+    into state.entry_price, the LINE PnL line keeps using the pre-add
+    average and overstates float profit by (broker_avg - old_avg) × N.
+    """
+    if broker is None:
+        return None
+    try:
+        positions = broker.get_positions()
+    except Exception as exc:
+        logger.warning("get_positions() failed during add reconcile: %s", exc)
+        return None
+
+    # MXF contract codes look like "MXFE5"; match by prefix so the futures
+    # roll doesn't break the lookup.
+    candidates = [
+        p for p in positions
+        if str(p.get("code", "")).startswith(product)
+        and p.get("direction", "Buy") == "Buy"
+    ]
+    if not candidates:
+        return None
+    # Sum across multiple position rows if Shioaji split them (shouldn't
+    # happen for a single long, but be defensive).
+    total_contracts = sum(int(p.get("contracts", p.get("quantity", 0))) for p in candidates)
+    if total_contracts != expected_contracts:
+        logger.warning(
+            "broker avg-price lookup: position size mismatch (expected=%d, broker=%d)",
+            expected_contracts, total_contracts,
+        )
+        return None
+    # Weighted average of the candidate rows (only one in practice).
+    total_qty = 0
+    total_value = 0.0
+    for p in candidates:
+        q = int(p.get("contracts", p.get("quantity", 0)))
+        px = float(p.get("avg_price", 0))
+        if q <= 0 or px <= 0:
+            return None
+        total_qty += q
+        total_value += px * q
+    if total_qty <= 0:
+        return None
+    return total_value / total_qty
+
+
+def _reconcile_add_entry_price(
+    broker,
+    product: str,
+    state: TradingState,
+    add_n: int,
+    fill_price: float,
+) -> tuple[float, str]:
+    """Recompute the post-add weighted entry price for *state* and write
+    it back. Prefers the broker's reported average (source-of-truth) and
+    falls back to a local (old_avg * old_n + fill * add_n) / new_n when
+    the broker read fails.
+
+    Returns (new_entry_price, source_label) for logging / notifications.
+    Must be called BEFORE state.position is mutated for the add.
+    """
+    old_n = state.position
+    new_n = old_n + add_n
+
+    broker_avg = _query_broker_avg_price(broker, product, new_n) if broker is not None else None
+    if broker_avg is not None and broker_avg > 0:
+        state.entry_price = broker_avg
+        logger.info(
+            "add reconcile: state.entry_price updated from broker avg = %.2f (was %.2f, +%d口)",
+            broker_avg, state.entry_price, add_n,
+        )
+        return broker_avg, "broker"
+
+    if state.entry_price is None or state.entry_price <= 0 or old_n <= 0:
+        # First-fill edge case (shouldn't happen on an add path, but
+        # defensive): fall back to the fill price.
+        state.entry_price = fill_price
+        return fill_price, "fill"
+
+    local_avg = (state.entry_price * old_n + fill_price * add_n) / new_n
+    logger.info(
+        "add reconcile: broker avg unavailable, local weighted avg = %.2f "
+        "(old=%.2f × %d, fill=%.2f × %d)",
+        local_avg, state.entry_price, old_n, fill_price, add_n,
+    )
+    state.entry_price = local_avg
+    return local_avg, "local"
 
 
 def _persist_live_equity(broker, state: TradingState, state_mgr) -> tuple[float, str]:

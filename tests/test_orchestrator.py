@@ -197,3 +197,120 @@ class TestEquityAutoUpdate:
             call.args[0].equity for call in state_mgr.save.call_args_list
         ]
         assert 730_000.0 in saved_equities
+
+
+class TestAddEntryPriceReconcile:
+    """Anti-Martingale add must refresh state.entry_price -- broker
+    weighted avg preferred, local weighted avg fallback. Without this
+    fix the LINE PnL kept using the pre-add average and overstated
+    float profit by (broker_avg - old_avg) × new_position."""
+
+    def test_add_uses_broker_avg_price(self):
+        """Holding 13口 @ 40,532; add 2口 fills at 42,415; broker reports
+        the blended avg at 40,783 → state.entry_price = 40,783 (not the
+        old 40,532, not the new fill 42,415)."""
+        state = TradingState(
+            position=13, entry_price=40_532.0, contracts=13,
+            equity=2_000_000.0,
+        )
+        sig = Signal("add", 2, "pyramid")
+        orch, _ = _make_orch(state, sig)
+        broker = MagicMock()
+        broker.place_order.return_value = {
+            "order_id": "ADD-1", "fill_price": 42_415.0,
+        }
+        # Broker reports the post-fill blended average.
+        broker.get_positions.return_value = [
+            {"code": "MXFE5", "direction": "Buy", "contracts": 15,
+             "avg_price": 40_783.0},
+        ]
+
+        df = _make_data()
+        with patch.object(orch, "_load_data", return_value=df):
+            result = orch.run_daily(broker=broker)
+
+        assert result["action"] == "add"
+        assert state.position == 15
+        assert state.entry_price == 40_783.0, (
+            "state.entry_price must follow the broker's blended average"
+        )
+        assert result.get("entry_price_source") == "broker"
+
+    def test_add_falls_back_to_local_weighted_avg(self):
+        """Broker.get_positions raises → use local weighted avg:
+        (13 × 40,532 + 2 × 42,415) / 15 = 40,783.0 (matches broker's)."""
+        state = TradingState(
+            position=13, entry_price=40_532.0, contracts=13,
+            equity=2_000_000.0,
+        )
+        sig = Signal("add", 2, "pyramid")
+        orch, _ = _make_orch(state, sig)
+        broker = MagicMock()
+        broker.place_order.return_value = {
+            "order_id": "ADD-2", "fill_price": 42_415.0,
+        }
+        broker.get_positions.side_effect = ConnectionError("api down")
+
+        df = _make_data()
+        with patch.object(orch, "_load_data", return_value=df):
+            result = orch.run_daily(broker=broker)
+
+        assert state.position == 15
+        expected = (13 * 40_532.0 + 2 * 42_415.0) / 15
+        assert abs(state.entry_price - expected) < 0.01, (
+            f"local weighted avg expected {expected:.2f}, got {state.entry_price}"
+        )
+        assert result.get("entry_price_source") == "local"
+
+    def test_add_falls_back_when_broker_size_mismatches(self):
+        """Broker returns a position whose contracts don't match the
+        expected post-add total → discard the broker number, use local
+        weighted avg (broker may be mid-update / showing stale row)."""
+        state = TradingState(
+            position=13, entry_price=40_532.0, contracts=13,
+            equity=2_000_000.0,
+        )
+        sig = Signal("add", 2, "pyramid")
+        orch, _ = _make_orch(state, sig)
+        broker = MagicMock()
+        broker.place_order.return_value = {
+            "order_id": "ADD-3", "fill_price": 42_415.0,
+        }
+        # Broker reports stale 13-contract position; size mismatch.
+        broker.get_positions.return_value = [
+            {"code": "MXFE5", "direction": "Buy", "contracts": 13,
+             "avg_price": 40_532.0},
+        ]
+
+        df = _make_data()
+        with patch.object(orch, "_load_data", return_value=df):
+            result = orch.run_daily(broker=broker)
+
+        expected = (13 * 40_532.0 + 2 * 42_415.0) / 15
+        assert abs(state.entry_price - expected) < 0.01
+        assert result.get("entry_price_source") == "local"
+
+    def test_add_via_run_execution_uses_broker_avg(self):
+        """run_execution (night_open phase 2) must apply the same
+        reconcile -- the bug was reported on a live night-session add."""
+        state = TradingState(
+            position=13, entry_price=40_532.0, contracts=13,
+            equity=2_000_000.0,
+            pending_action="add", pending_contracts=2,
+        )
+        # Strategy.generate_signal won't be called from run_execution,
+        # so the signal_override is irrelevant; pass a placeholder.
+        orch, _ = _make_orch(state, Signal("hold", 0, ""))
+        broker = MagicMock()
+        broker.place_order.return_value = {
+            "order_id": "ADD-N", "fill_price": 42_415.0,
+        }
+        broker.get_positions.return_value = [
+            {"code": "MXFE5", "direction": "Buy", "contracts": 15,
+             "avg_price": 40_783.0},
+        ]
+
+        orch.run_execution(broker=broker, exec_price=42_415.0)
+
+        assert state.position == 15
+        assert state.entry_price == 40_783.0
