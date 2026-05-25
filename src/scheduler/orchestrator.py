@@ -168,12 +168,14 @@ class V2bOrchestrator:
                 result["exit_price"] = exec_price
                 result["pnl_twd"] = pnl_twd
                 _closed_contracts = closed_n
-            # Reset position state
-            state.position = 0
-            state.entry_price = None
-            state.contracts = 0
-            state.highest_high = None
-            state.pyramided = False
+                # Reset position state — only when the close actually filled.
+                # A rejected Sell means the broker still holds the position;
+                # zeroing here would desync state and risk a double position.
+                state.position = 0
+                state.entry_price = None
+                state.contracts = 0
+                state.highest_high = None
+                state.pyramided = False
 
             # Settlement rollover: re-check entry immediately
             # Only proceed if sell was successful
@@ -466,11 +468,15 @@ class V2bOrchestrator:
                 state.equity += pnl_twd
                 result["exit_price"] = exec_price
                 result["pnl_twd"] = pnl_twd
-            state.position = 0
-            state.entry_price = None
-            state.contracts = 0
-            state.highest_high = None
-            state.pyramided = False
+                # Only flatten local state when the close actually filled. A
+                # rejected Sell means the broker still holds the position —
+                # zeroing here would desync state and risk a double position
+                # (the system would think it's flat and buy again).
+                state.position = 0
+                state.entry_price = None
+                state.contracts = 0
+                state.highest_high = None
+                state.pyramided = False
 
             # ── Settlement rollover: re-check entry immediately ───
             # Only proceed if sell was successful (not rejected by exchange)
