@@ -12,11 +12,15 @@ import json
 import logging
 import os
 import sys
+from datetime import date, datetime
+from datetime import time as dtime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
+
+from src.data.tw_holidays import last_trading_day_before, trading_days_between
 
 try:
     from dotenv import load_dotenv
@@ -30,6 +34,41 @@ logger = logging.getLogger(__name__)
 
 _DATA = Path("data/MXF_Daily_Clean_2020_to_now.parquet")
 _STATE = Path("data/paper_state.json")
+
+# daily_updater pulls the current session's bar at 14:25 Taipei.
+_UPDATE_CUTOFF = dtime(14, 25)
+
+
+def _expected_latest(now: datetime) -> date:
+    """The most recent trading-day bar the parquet should already contain.
+
+    Before 14:25 today's bar hasn't been pulled yet, and we allow one extra
+    trading day of slack for the updater → expect the 2nd-to-last trading day.
+    At/after 14:25 → expect the previous trading day.
+    """
+    prev = last_trading_day_before(now.date())
+    if now.time() < _UPDATE_CUTOFF:
+        return last_trading_day_before(prev)
+    return prev
+
+
+def check_freshness(now: datetime, latest: date) -> tuple[str, str]:
+    """Classify parquet freshness in TRADING days (weekends + TAIFEX holidays
+    excluded), not calendar days.
+
+    Returns ``(level, detail)`` where level is one of:
+      ``"ok"``    — latest >= expected            (✅)
+      ``"warn"``  — 1–2 trading days behind        (⚠️)
+      ``"alert"`` — > 2 trading days behind         (🔴)
+    """
+    expected = _expected_latest(now)
+    if latest >= expected:
+        return "ok", f"latest={latest}, expected≥{expected}"
+    behind = sum(1 for d in trading_days_between(latest, expected) if d > latest)
+    detail = f"latest={latest}, expected≥{expected}, 落後 {behind} 交易日"
+    if behind > 2:
+        return "alert", f"Parquet 過期: {detail}"
+    return "warn", f"Parquet 稍舊: {detail}"
 
 
 def _send_line(msg: str) -> None:
@@ -107,7 +146,7 @@ def _refresh_state_equity_from_broker() -> str:
 
 def main():
     issues = []
-    today = pd.Timestamp.now(tz="Asia/Taipei").date()
+    warns = []
 
     # 0. Refresh state.equity from live broker BEFORE reading state below,
     # so the report reflects the most recent margin balance.
@@ -115,15 +154,21 @@ def main():
     if refresh_summary:
         logger.info(refresh_summary)
 
-    # 1. Parquet freshness
+    # 1. Parquet freshness — measured in TRADING days (weekends + TAIFEX
+    #    holidays excluded). Before 14:25 today's bar isn't pulled yet, so we
+    #    expect the 2nd-to-last trading day; calendar-day math used to fire a
+    #    false 🔴 every Monday/post-holiday morning.
     if _DATA.exists():
         df = pd.read_parquet(_DATA)
         df.index = pd.to_datetime(df.index)
         latest = df.index[-1].date()
-        gap = (today - latest).days
-        if gap > 3:
-            issues.append(f"Parquet 過期: latest={latest}, gap={gap}天")
-        logger.info("Parquet: %d bars, latest=%s, gap=%dd", len(df), latest, gap)
+        now = pd.Timestamp.now(tz="Asia/Taipei")
+        level, detail = check_freshness(now, latest)
+        if level == "alert":
+            issues.append(detail)
+        elif level == "warn":
+            warns.append(detail)
+        logger.info("Parquet: %d bars, %s [%s]", len(df), detail, level)
     else:
         issues.append(f"Parquet 不存在: {_DATA}")
 
@@ -186,22 +231,29 @@ def main():
         logger.debug("pnl_tracker skipped: %s", exc)
 
     # 5. Report — always notify
+    status_block = (
+        f"資料: {bars} bars ({latest})\n"
+        f"持倉: {state_line}\n"
+        f"淨值: {eq_line}"
+        f"{pnl_line}"
+    )
     if issues:
-        msg = (
-            "🔴 每日健康檢查異常\n"
-            + "\n".join(f"• {i}" for i in issues)
-        )
+        lines = [f"• {i}" for i in issues] + [f"• ⚠️ {w}" for w in warns]
+        msg = "🔴 每日健康檢查異常\n" + "\n".join(lines)
         logger.error(msg)
         _send_line(msg)
         sys.exit(1)
-    else:
+    elif warns:
         msg = (
-            f"✅ 每日健康檢查通過\n"
-            f"資料: {bars} bars ({latest})\n"
-            f"持倉: {state_line}\n"
-            f"淨值: {eq_line}"
-            f"{pnl_line}"
+            "⚠️ 每日健康檢查警告\n"
+            + "\n".join(f"• {w}" for w in warns)
+            + "\n"
+            + status_block
         )
+        logger.warning(msg)
+        _send_line(msg)
+    else:
+        msg = f"✅ 每日健康檢查通過\n{status_block}"
         logger.info(msg)
         _send_line(msg)
 
