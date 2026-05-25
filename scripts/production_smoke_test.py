@@ -199,6 +199,8 @@ def check_data() -> int:
     _section("4. Data Integrity")
     import pandas as pd
 
+    from scripts.daily_health_check import check_freshness
+
     pq = Path("data/MXF_Daily_Clean_2020_to_now.parquet")
     if not pq.exists():
         _check("parquet exists", False, str(pq))
@@ -215,10 +217,12 @@ def check_data() -> int:
         fails += 1
 
     latest = df.index[-1].date()
-    today = pd.Timestamp.now(tz="Asia/Taipei").date()
-    gap = (today - latest).days
-    _check("latest date fresh", gap <= 3, f"latest={latest}, gap={gap}d")
-    if gap > 3:
+    now = pd.Timestamp.now(tz="Asia/Taipei")
+    # Trading-day freshness (weekends + TAIFEX holidays excluded); warn does
+    # not block PRODUCTION READY, only a true >2-trading-day stale → fail.
+    level, detail = check_freshness(now, latest)
+    _check("latest date fresh", level != "alert", detail)
+    if level == "alert":
         fails += 1
 
     weekend = df[df.index.dayofweek >= 5]
