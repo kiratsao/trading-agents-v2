@@ -455,7 +455,7 @@ class TestShioajiFetchEndDate:
             High = list(prices)
             Low = list(prices)
             Close = list(prices)
-            Volume = [100] * len(prices)
+            Volume = [50_000] * len(prices)  # above the day-session volume floor
         return _K()
 
     def test_end_date_is_yesterday_only(self):

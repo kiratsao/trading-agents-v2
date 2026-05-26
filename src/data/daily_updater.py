@@ -19,9 +19,8 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
-from datetime import date, time, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,10 +30,6 @@ logger = logging.getLogger(__name__)
 
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 _PRIMARY_PARQUET = _DATA_DIR / "MXF_Daily_Clean_2020_to_now.parquet"
-
-_DAY_OPEN = time(8, 45)
-_DAY_CLOSE = time(13, 45)
-_SETTLE_CLOSE = time(13, 30)  # settlement day regular session ends 13:30
 
 # Number of recent trading days to re-scan after each update. Anything
 # missing inside this window (per TAIFEX calendar) triggers a back-fill
@@ -347,107 +342,19 @@ def _detect_and_fill_gaps(
 
 
 def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
-    """Connect to Shioaji, fetch 1-min kbars, aggregate to daily OHLCV."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
+    """Fetch daily day-session OHLCV from Shioaji over [start, end] INCLUSIVE.
 
-    api_key = os.environ.get("SHIOAJI_API_KEY", "")
-    secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
-    if not api_key or not secret_key:
-        raise RuntimeError(
-            "SHIOAJI_API_KEY / SHIOAJI_SECRET_KEY not set — check .env"
-        )
+    Thin delegator to the single authoritative fetcher in
+    ``src.data.shioaji_fetcher`` — all day-session filtering / aggregation /
+    settlement-exclusion lives there now, so there is exactly one place that
+    can be wrong (or right). Returns None when nothing valid was fetched.
+    """
+    from src.data.shioaji_fetcher import fetch_via_env
 
-    from tw_futures.executor.shioaji_adapter import ShioajiAdapter
-
-    adapter = ShioajiAdapter(
-        api_key=api_key,
-        secret_key=secret_key,
-        simulation=False,
-        cert_path=os.environ.get("SHIOAJI_CERT_PATH") or None,
-        cert_password=os.environ.get("SHIOAJI_CERT_PASSWORD") or None,
-        person_id=os.environ.get("SHIOAJI_PERSON_ID") or None,
-    )
-
-    try:
-        contract = adapter.get_contract("MXF")
-        # `end` is the LAST completed trading day (yesterday at 14:25 cron
-        # time). Empirically Shioaji's `end` is INCLUSIVE, so the previous
-        # `end_plus = end + 1 day` query pulled today's still-evolving day
-        # session bar. At 14:25 the day session has just closed (13:44) but
-        # the settlement close hasn't published yet, so today's intra-day
-        # last-tick mis-represented the official close by up to ~1,300pt.
-        # Operators verifying the API semantics can run the probe script at
-        # scripts/probe_shioaji_kbars_end_semantics.py before changing this.
-        kbars = adapter._api.kbars(
-            contract,
-            start=str(start),
-            end=str(end),
-            timeout=30_000,
-        )
-    finally:
-        adapter.logout()
-
-    if not kbars or len(kbars.ts) == 0:
-        logger.info("daily_updater: Shioaji returned empty kbars")
+    daily = fetch_via_env(start, end, product="MXF")
+    if daily is None or daily.empty:
+        logger.info("daily_updater: Shioaji returned empty day-session data")
         return None
-
-    raw = pd.DataFrame({
-        "ts": kbars.ts,
-        "open": kbars.Open,
-        "high": kbars.High,
-        "low": kbars.Low,
-        "close": kbars.Close,
-        "volume": kbars.Volume,
-    })
-    raw["ts"] = pd.to_datetime(
-        raw["ts"], unit="ns", utc=True,
-    ).dt.tz_convert("Asia/Taipei")
-    raw = raw.sort_values("ts")
-
-    # Day session filter: 08:45 <= t < 13:45 (normal) or < 13:30 (settlement)
-    from src.strategy.v2b_engine import _is_settlement_day
-
-    t = raw["ts"].dt.time
-    mask = (t >= _DAY_OPEN) & (t < _DAY_CLOSE)
-    day = raw[mask].copy()
-
-    # Remove 13:30-13:44 bars on settlement days
-    if not day.empty:
-        day_dates = day["ts"].dt.normalize()
-        is_settle = day_dates.apply(lambda d: _is_settlement_day(d))
-        settle_late = is_settle & (day["ts"].dt.time >= _SETTLE_CLOSE)
-        day = day[~settle_late]
-
-    if day.empty:
-        return None
-
-    day["date"] = day["ts"].dt.date
-    daily = day.groupby("date").agg(
-        open=("open", "first"),
-        high=("high", "max"),
-        low=("low", "min"),
-        close=("close", "last"),
-        volume=("volume", "sum"),
-    )
-    daily.index = pd.DatetimeIndex(daily.index, name="date")
-    # Defense-in-depth: even if the upstream `end` argument leaks a future
-    # API change or someone re-introduces +1, any bar strictly newer than
-    # the requested end (= last completed trading day) MUST be dropped.
-    # A 14:25 query that surfaces today's still-evolving bar is the exact
-    # bug that contaminated the parquet by ~1,300pt.
-    cutoff = pd.Timestamp(end)
-    bad = daily.index > cutoff
-    if bad.any():
-        dropped = [str(d.date()) for d in daily.index[bad]]
-        logger.warning(
-            "daily_updater: dropping %d bar(s) newer than end=%s: %s",
-            int(bad.sum()), end, dropped,
-        )
-        daily = daily[~bad]
     return daily
 
 

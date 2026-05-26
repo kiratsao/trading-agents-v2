@@ -851,13 +851,11 @@ class V2bOrchestrator:
 
 
 def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | None:
-    """Fetch today's day-session daily bar from Shioaji kbars (1-min aggregation).
+    """Fetch today's day-session daily bar from Shioaji.
 
-    Strategy (matches daily_updater logic exactly):
-      1. Fetch today's 1-min kbars via Shioaji API
-      2. Filter to day-session only (08:45–13:44)
-      3. Aggregate OHLCV: open=first, high=max, low=min, close=last bar's close
-      4. If kbars fails → fallback to snapshot (less accurate but better than nothing)
+    Delegates the kbars fetch + day-session filtering + aggregation to the one
+    authoritative fetcher (``src.data.shioaji_fetcher.fetch_day_session_bar``);
+    falls back to a snapshot (last-traded price) only if that returns nothing.
 
     Uses an existing *broker* (ShioajiAdapter) when provided so that a
     second login does not steal the caller's session.
@@ -865,9 +863,7 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
     Returns a dict with open/high/low/close/volume/date, or None on failure.
     """
     import os
-    from datetime import date, time
-
-    import pandas as pd
+    from datetime import date
 
     # Reuse existing broker connection if available
     owns_adapter = broker is None
@@ -894,72 +890,18 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
 
     today = date.today()
 
-    # --- Primary: 1-min kbars aggregation (exact day-session close) ---
+    # --- Primary: authoritative day-session bar (single source of truth) ---
     try:
-        tomorrow = pd.Timestamp(today) + pd.Timedelta(days=1)
+        from src.data.shioaji_fetcher import fetch_day_session_bar
+
         contract = broker.get_contract("MXF")
-        kbars = broker._api.kbars(
-            contract,
-            start=str(today),
-            end=str(tomorrow.date()),
-            timeout=15_000,
-        )
-
-        if kbars and len(kbars.ts) > 0:
-            df = pd.DataFrame(
-                {
-                    "ts": kbars.ts,
-                    "open": kbars.Open,
-                    "high": kbars.High,
-                    "low": kbars.Low,
-                    "close": kbars.Close,
-                    "volume": kbars.Volume,
-                }
-            )
-            df["ts"] = pd.to_datetime(df["ts"], unit="ns", utc=True).dt.tz_convert(
-                "Asia/Taipei"
-            )
-            df = df.sort_values("ts")
-
-            # Day session: 08:45–13:44 (normal) or 08:45–13:29 (settlement)
-            from src.strategy.v2b_engine import _is_settlement_day
-
-            day_open = time(8, 45)
-            day_close = (
-                time(13, 30) if _is_settlement_day(pd.Timestamp(today)) else time(13, 45)
-            )
-            today_mask = (
-                (df["ts"].dt.date == today)
-                & (df["ts"].dt.time >= day_open)
-                & (df["ts"].dt.time < day_close)
-            )
-            day_df = df[today_mask]
-
-            if not day_df.empty:
-                result = {
-                    "date": str(today),
-                    "open": float(day_df.iloc[0]["open"]),
-                    "high": float(day_df["high"].max()),
-                    "low": float(day_df["low"].min()),
-                    "close": float(day_df.iloc[-1]["close"]),
-                    "volume": int(day_df["volume"].sum()),
-                }
-                logger.info(
-                    "_fetch_today_bar_shioaji: kbars OK  close=%.0f  bars=%d",
-                    result["close"],
-                    len(day_df),
-                )
-                if owns_adapter:
-                    broker.logout()
-                return result
-
-            logger.debug(
-                "_fetch_today_bar_shioaji: no day-session bars in kbars (total=%d)",
-                len(df),
-            )
-        else:
-            logger.debug("_fetch_today_bar_shioaji: kbars empty for %s", today)
-
+        bar = fetch_day_session_bar(broker._api, contract, today)
+        if bar is not None:
+            logger.info("_fetch_today_bar_shioaji: kbars OK  close=%.0f", bar["close"])
+            if owns_adapter:
+                broker.logout()
+            return {"date": str(today), **bar}
+        logger.debug("_fetch_today_bar_shioaji: no day-session bar for %s", today)
     except Exception as exc:
         logger.warning("_fetch_today_bar_shioaji: kbars failed: %s — trying snapshot", exc)
 

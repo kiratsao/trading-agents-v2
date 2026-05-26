@@ -213,6 +213,26 @@ PRODUCT_FETCHERS = {
 }
 
 
+def _remove_taifex_holidays(daily: pd.DataFrame) -> pd.DataFrame:
+    """Drop bars dated on a TAIFEX holiday (e.g. a 夜盤 bar mis-attributed to a
+    closed day). Uses an explicit numpy boolean mask — the old
+    ``Index.map(...).sum()`` crashed on the object-dtype result."""
+    import numpy as np
+
+    from src.data.tw_holidays import is_taifex_holiday
+
+    if daily is None or len(daily) == 0:
+        return daily
+    idx = pd.DatetimeIndex(daily.index)
+    mask = np.array([is_taifex_holiday(ts.date()) for ts in idx], dtype=bool)
+    n = int(mask.sum())
+    if n > 0:
+        removed = idx[mask].strftime("%Y-%m-%d").tolist()
+        print(f"  Removed {n} holiday bars: {removed[:10]}")
+        daily = daily[~mask]
+    return daily
+
+
 def main():
     parser = argparse.ArgumentParser(description="Rebuild daily K parquet for a product.")
     parser.add_argument(
@@ -221,43 +241,17 @@ def main():
         choices=list(PRODUCT_FETCHERS.keys()),
         help="Which product to fetch (default: MXF)",
     )
-    parser.add_argument(
-        "--no-validate",
-        action="store_true",
-        help="Skip the recent-20-day Shioaji cross-validation (MXF only).",
-    )
     args = parser.parse_args()
 
     fetcher, filename = PRODUCT_FETCHERS[args.product]
     daily = fetcher()
     out_path = DATA_DIR / filename
 
-    # Remove TAIFEX holidays (e.g. 5/1 勞動節 — 夜盤 bar 被誤歸該日)
-    from src.data.tw_holidays import is_taifex_holiday
-
-    holiday_mask = daily.index.map(lambda ts: is_taifex_holiday(ts.date()))
-    n_holidays = holiday_mask.sum()
-    if n_holidays > 0:
-        removed_dates = daily.index[holiday_mask].strftime("%Y-%m-%d").tolist()
-        print(f"  Removed {n_holidays} holiday bars: {removed_dates[:10]}")
-        daily = daily[~holiday_mask]
-
-    # Cross-validate the recent 20 days against Shioaji (B1). TAIFEX is the
-    # build source; Shioaji is the independent oracle — divergence > 50pt is
-    # overridden with the Shioaji value. MXF only (Shioaji has no 2330 daily).
-    if args.product == "MXF" and not args.no_validate:
-        try:
-            from src.data.validation import validate_and_override_with_shioaji
-
-            daily, overridden = validate_and_override_with_shioaji(
-                daily, recent_days=20, log=print,
-            )
-            if overridden:
-                print(f"  Cross-validation: overrode {len(overridden)} bar(s) with Shioaji")
-            else:
-                print("  Cross-validation: recent 20 days agree with Shioaji (差 ≤ 50pt)")
-        except Exception as exc:
-            print(f"  Cross-validation skipped (Shioaji unavailable): {exc}")
+    # TAIFEX is ground truth — the build does NOT pass through Shioaji.
+    # (Cross-validation against Shioaji is a separate, opt-in step via
+    # deep_health_check; init_data must not let a buggy Shioaji fetch
+    # overwrite authoritative exchange data.)
+    daily = _remove_taifex_holidays(daily)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     daily.to_parquet(out_path, index=True)

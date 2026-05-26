@@ -37,6 +37,10 @@ _VOLUME_FLOOR = 30_000          # day-session volume sanity floor
 _CLOSE_JUMP_PCT = 10.0          # |Δclose| beyond this is flagged (not auto-fixed)
 _EQUITY_DRIFT_PCT = 5.0         # state.equity vs broker beyond this → auto-fix
 _ENTRY_DRIFT_PTS = 50.0         # state.entry_price vs broker beyond this → auto-fix
+# Round-2 parquet override is the dangerous one (it once rewrote correct data
+# with a buggy Shioaji value). Override ONLY when both hold:
+_OVERRIDE_MIN_DIFF = 200.0      # < 200pt may be benign (settle price vs last trade)
+_OVERRIDE_MIN_VOLUME = 30_000   # ref must look like a real, complete day session
 
 
 @dataclass
@@ -133,39 +137,67 @@ def round2_shioaji_cross(
     parquet_path: Path | None = None,
     shioaji_fetch=None,
     recent_days: int = 20,
-    do_fix: bool = True,
+    do_fix: bool = False,
+    notify_fn=None,
 ) -> tuple[list[Check], pd.DataFrame, list[str]]:
-    from src.data.validation import validate_and_override_with_shioaji
+    """Compare recent parquet closes vs Shioaji. Auto-fix is OFF by default and,
+    even with --fix, ONLY overrides a bar when the divergence is large
+    (> _OVERRIDE_MIN_DIFF pt) AND the reference is a real day session
+    (volume > _OVERRIDE_MIN_VOLUME) — small diffs are likely the benign
+    settlement-price vs last-trade gap and are left alone. The original parquet
+    is backed up first and every override emits a LINE notice."""
+    from src.data.validation import compare_to_shioaji
 
     R = 2
     if df is None or len(df) == 0:
         return [Check(R, "Shioaji 交叉驗證", "skip", "無資料")], df, []
     try:
-        new_df, overridden = validate_and_override_with_shioaji(
-            df, recent_days=recent_days, shioaji_fetch=shioaji_fetch,
-            log=lambda m: logger.warning(m),
-        )
+        diffs, ref = compare_to_shioaji(df, recent_days=recent_days, shioaji_fetch=shioaji_fetch)
     except Exception as exc:
         return [Check(R, "Shioaji 交叉驗證", "skip", f"無法連線 Shioaji: {exc}")], df, []
 
-    if not overridden:
+    if not diffs:
         return [Check(R, "Shioaji 交叉驗證", "ok",
-                      f"近 {recent_days} 天 close 差距 < 50 點")], new_df, []
+                      f"近 {recent_days} 天 close 差距 < 50 點")], df, []
+
+    fixable = [cd for cd in diffs
+               if cd.ref_volume > _OVERRIDE_MIN_VOLUME and cd.diff > _OVERRIDE_MIN_DIFF]
+    skipped = [cd for cd in diffs if cd not in fixable]
 
     fixes: list[str] = []
-    if do_fix and parquet_path is not None:
-        backup = Path(parquet_path).with_suffix(
-            f".pre_fix_{date.today().isoformat()}.parquet")
+    if do_fix and fixable and parquet_path is not None:
+        import datetime as _dt
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = Path(parquet_path).parent / f"parquet_backup_{stamp}.parquet"
         try:
-            df.to_parquet(backup, index=True)          # backup ORIGINAL
+            df.to_parquet(backup, index=True)              # backup ORIGINAL first
+            new_df = df.copy()
+            new_df.index = pd.DatetimeIndex(new_df.index).normalize()
+            new_df.index.name = "date"
+            for cd in fixable:
+                tsd = pd.Timestamp(cd.day)
+                for col in ("open", "high", "low", "close", "volume"):
+                    if col in ref.columns and tsd in ref.index:
+                        new_df.loc[tsd, col] = ref.loc[tsd, col]
+                msg = (f"{cd.day} close {cd.parquet_close:.0f}→{cd.ref_close:.0f} "
+                       f"(差 {cd.diff:.0f}, vol={cd.ref_volume:.0f})")
+                fixes.append(msg)
+                if notify_fn:
+                    notify_fn(f"🔧 parquet 覆蓋: {msg}（已備份 {backup.name}）")
             new_df.to_parquet(parquet_path, index=True)
-            for cd in overridden:
-                fixes.append(f"parquet {cd.day} close → Shioaji {cd.ref_close:.0f}")
+            df = new_df
         except Exception as exc:
             return [Check(R, "Shioaji 交叉驗證", "alert",
-                          f"{len(overridden)} 筆偏差，覆蓋失敗: {exc}")], df, []
-    detail = f"{len(overridden)} 筆 > 50 點" + ("，已用 Shioaji 覆蓋(已備份)" if fixes else "")
-    return [Check(R, "Shioaji 交叉驗證", "warn", detail)], new_df, fixes
+                          f"{len(fixable)} 筆待覆蓋，寫入失敗: {exc}")], df, []
+
+    parts = [f"{len(diffs)} 筆 > 50 點"]
+    if fixes:
+        parts.append(f"{len(fixes)} 筆已覆蓋(>200點且日盤量足，已備份)")
+    if skipped:
+        parts.append(f"{len(skipped)} 筆未動(差<200點或量不足，疑正常價差)")
+    elif not do_fix and fixable:
+        parts.append(f"{len(fixable)} 筆可覆蓋，需 --fix 啟用")
+    return [Check(R, "Shioaji 交叉驗證", "warn", "; ".join(parts))], df, fixes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,7 +398,7 @@ def round6_signal_replay(
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_rounds(
     *, parquet_path, config_path, state_dir, broker, shioaji_fetch,
-    log_dir, investors, do_fix, light,
+    log_dir, investors, do_fix, light, notify_fn=None,
 ) -> tuple[list[Check], list[str]]:
     checks: list[Check] = []
     fixes: list[str] = []
@@ -378,7 +410,8 @@ def _run_rounds(
 
     if not light:
         r2c, df, r2f = round2_shioaji_cross(
-            df, parquet_path=parquet_path, shioaji_fetch=shioaji_fetch, do_fix=do_fix)
+            df, parquet_path=parquet_path, shioaji_fetch=shioaji_fetch,
+            do_fix=do_fix, notify_fn=notify_fn)
         checks += r2c
         fixes += r2f
 
@@ -416,13 +449,16 @@ def run_deep_health_check(
     shioaji_fetch=None,
     log_dir: Path | None = None,
     investors: dict | None = None,
-    do_fix: bool = True,
+    do_fix: bool = False,
     light: bool = False,
     max_iters: int = 3,
     notify_fn=None,
 ) -> dict:
     """Run the battery; re-run after any auto-fix (≤ max_iters). Returns a
-    summary dict and emits a LINE alert if a 🔴 survives all iterations."""
+    summary dict and emits a LINE alert if a 🔴 survives all iterations.
+
+    ``do_fix`` defaults to False — auto-fix (incl. parquet override) is opt-in
+    only, surfaced via the ``--fix`` CLI flag."""
     checks: list[Check] = []
     all_fixes: list[str] = []
     iteration = 0
@@ -430,7 +466,7 @@ def run_deep_health_check(
         checks, fixes = _run_rounds(
             parquet_path=parquet_path, config_path=config_path, state_dir=state_dir,
             broker=broker, shioaji_fetch=shioaji_fetch, log_dir=log_dir,
-            investors=investors, do_fix=do_fix, light=light,
+            investors=investors, do_fix=do_fix, light=light, notify_fn=notify_fn,
         )
         all_fixes += fixes
         if not fixes:
@@ -544,7 +580,8 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description="Deep multi-round health check")
     ap.add_argument("--light", action="store_true", help="Round 1 + 3 only (daily 08:00)")
-    ap.add_argument("--no-fix", action="store_true", help="report only, never mutate")
+    ap.add_argument("--fix", action="store_true",
+                    help="enable auto-fix (parquet override / state). OFF by default.")
     ap.add_argument("--config", default="config/accounts.yaml")
     ap.add_argument("--parquet", default="data/MXF_Daily_Clean_2020_to_now.parquet")
     args = ap.parse_args(argv)
@@ -558,7 +595,7 @@ def main(argv=None) -> int:
     log_dir = Path("logs") if Path("logs").exists() else None
     result = run_deep_health_check(
         parquet_path=args.parquet, config_path=args.config,
-        do_fix=not args.no_fix, light=args.light,
+        do_fix=args.fix, light=args.light,
         log_dir=log_dir, notify_fn=_line_notifier(),
     )
     return 1 if result["alert"] else 0

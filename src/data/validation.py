@@ -39,10 +39,11 @@ class CloseDiff:
     ref_close: float
     diff: float          # absolute difference in points
     source: str          # "shioaji" | "taifex"
+    ref_volume: float = 0.0   # reference bar volume (for day-session sanity)
 
     def __str__(self) -> str:
         return (f"{self.day} {self.source}: parquet={self.parquet_close:.0f} "
-                f"vs ref={self.ref_close:.0f} (差 {self.diff:.0f})")
+                f"vs ref={self.ref_close:.0f} (差 {self.diff:.0f}, vol={self.ref_volume:.0f})")
 
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -55,8 +56,9 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 # Default production fetchers (lazy imports avoid circulars / network at import)
 # ─────────────────────────────────────────────────────────────────────────────
 def _default_shioaji_fetch(start: date, end: date) -> pd.DataFrame | None:
-    from src.data.daily_updater import _fetch_and_aggregate
-    return _fetch_and_aggregate(start, end)
+    # Single authoritative day-session fetch (same as daily_updater uses).
+    from src.data.shioaji_fetcher import fetch_via_env
+    return fetch_via_env(start, end, product="MXF")
 
 
 def _default_taifex_fetch(start: date, end: date) -> pd.DataFrame | None:
@@ -126,52 +128,45 @@ def validate_latest_bar(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# B1: cross-validate recent parquet history vs Shioaji, override on divergence
+# Recent-history comparison vs Shioaji — REPORT ONLY (no mutation).
+# The override decision + safety valve (volume / >200pt / backup / LINE) lives
+# in deep_health_check Round 2 so nothing silently rewrites the parquet.
 # ─────────────────────────────────────────────────────────────────────────────
-def validate_and_override_with_shioaji(
+def compare_to_shioaji(
     df: pd.DataFrame,
     *,
     recent_days: int = 20,
     shioaji_fetch: FetchFn | None = None,
     threshold: float = WARN_THRESHOLD,
-    log: Callable[[str], None] | None = None,
-) -> tuple[pd.DataFrame, list[CloseDiff]]:
-    """For the last *recent_days* parquet bars, compare close vs Shioaji and
-    OVERRIDE the parquet row (full OHLCV) with Shioaji's when |diff| > threshold.
+) -> tuple[list[CloseDiff], pd.DataFrame]:
+    """Compare the last *recent_days* parquet closes against Shioaji.
 
-    Returns ``(possibly-modified df, list of overridden CloseDiff)``.
+    Returns ``(diffs over threshold, normalized reference df)``. Pure: never
+    mutates *df*. Fetch failure / empty reference propagates so the caller
+    reports a skip rather than masquerading a dead oracle as "clean".
     """
-    emit = log or logger.warning
     if df is None or len(df) == 0:
-        return df, []
+        return [], pd.DataFrame()
 
     df = _normalize(df).sort_index()
     days = [d.date() for d in df.index[-recent_days:]]
     if not days:
-        return df, []
+        return [], pd.DataFrame()
 
-    # Fetch failures propagate so the CALLER decides (init_data prints "skipped",
-    # deep_health_check Round 2 reports ⏭️) — silently returning "no diffs" here
-    # would masquerade an unreachable oracle as a clean validation.
     fetch = shioaji_fetch or _default_shioaji_fetch
     ref = fetch(days[0], days[-1])
     if ref is None or len(ref) == 0:
         raise ValueError("Shioaji returned no reference data")
 
     ref = _normalize(ref)
-    overridden: list[CloseDiff] = []
+    diffs: list[CloseDiff] = []
     for d in days:
         ts = pd.Timestamp(d)
         if ts not in ref.index or "close" not in ref.columns:
             continue
         pc = float(df.loc[ts, "close"])
         rc = float(ref.loc[ts, "close"])
+        rv = float(ref.loc[ts, "volume"]) if "volume" in ref.columns else 0.0
         if abs(pc - rc) > threshold:
-            cd = CloseDiff(d, pc, rc, abs(pc - rc), "shioaji")
-            emit(f"⚠️ {cd} — 用 Shioaji 覆蓋")
-            for col in ("open", "high", "low", "close", "volume"):
-                if col in ref.columns:
-                    df.loc[ts, col] = ref.loc[ts, col]
-            overridden.append(cd)
-
-    return df, overridden
+            diffs.append(CloseDiff(d, pc, rc, abs(pc - rc), "shioaji", rv))
+    return diffs, ref

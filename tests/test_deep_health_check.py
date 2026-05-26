@@ -144,21 +144,59 @@ def test_round2_ok_when_shioaji_agrees(tmp_path):
     assert checks[0].status == "ok" and fixes == []
 
 
-def test_round2_overrides_and_backs_up_on_divergence(tmp_path):
-    p = tmp_path / "p.parquet"
-    df = write_synthetic_parquet(p, n_bars=30, end=date(2026, 5, 21))
-
+def _diverge_factory(df, *, delta=400, volume=None):
     def diverge(a, b):
         ref = df.copy()
-        ref.iloc[-1, ref.columns.get_loc("close")] += 400  # >50pt on latest day
+        ref.iloc[-1, ref.columns.get_loc("close")] += delta
+        if volume is not None:
+            ref.iloc[-1, ref.columns.get_loc("volume")] = volume
         return ref
+    return diverge
 
+
+def test_round2_overrides_and_backs_up_with_fix(tmp_path):
+    p = tmp_path / "p.parquet"
+    df = write_synthetic_parquet(p, n_bars=30, end=date(2026, 5, 21))  # volume ~50k
+    notes: list[str] = []
     checks, new_df, fixes = round2_shioaji_cross(
-        df, parquet_path=p, shioaji_fetch=diverge, do_fix=True)
+        df, parquet_path=p, shioaji_fetch=_diverge_factory(df, delta=400),
+        do_fix=True, notify_fn=notes.append)
     assert checks[0].status == "warn"
     assert len(fixes) == 1
-    # backup of the ORIGINAL was written
-    assert list(tmp_path.glob("*.pre_fix_*.parquet"))
+    assert list(tmp_path.glob("parquet_backup_*.parquet"))   # original backed up
+    assert any(m.startswith("🔧") for m in notes)            # LINE per override
+
+
+def test_deep_health_auto_fix_off_by_default(tmp_path):
+    p = tmp_path / "p.parquet"
+    df = write_synthetic_parquet(p, n_bars=30, end=date(2026, 5, 21))
+    # do_fix not passed → defaults False → divergence reported but NOT written
+    checks, _, fixes = round2_shioaji_cross(
+        df, parquet_path=p, shioaji_fetch=_diverge_factory(df, delta=400))
+    assert fixes == []
+    assert not list(tmp_path.glob("parquet_backup_*.parquet"))
+    assert checks[0].status == "warn"
+
+
+def test_deep_health_fix_requires_high_volume(tmp_path):
+    p = tmp_path / "p.parquet"
+    df = write_synthetic_parquet(p, n_bars=30, end=date(2026, 5, 21))
+    # big diff but ref volume below floor → NOT a real day session → no override
+    checks, _, fixes = round2_shioaji_cross(
+        df, parquet_path=p, shioaji_fetch=_diverge_factory(df, delta=400, volume=100),
+        do_fix=True)
+    assert fixes == []
+    assert not list(tmp_path.glob("parquet_backup_*.parquet"))
+
+
+def test_deep_health_fix_skips_small_diff(tmp_path):
+    p = tmp_path / "p.parquet"
+    df = write_synthetic_parquet(p, n_bars=30, end=date(2026, 5, 21))
+    # 80pt diff > warn(50) but < override(200) → reported, not overwritten
+    checks, _, fixes = round2_shioaji_cross(
+        df, parquet_path=p, shioaji_fetch=_diverge_factory(df, delta=80), do_fix=True)
+    assert fixes == []
+    assert checks[0].status == "warn"
 
 
 def test_round2_skips_when_fetch_dead(tmp_path):

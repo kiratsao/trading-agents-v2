@@ -231,15 +231,14 @@ def main():
         logger.debug("pnl_tracker skipped: %s", exc)
 
     # 4b. Light deep health check (Round 1 data integrity + Round 3 state).
-    #     Best-effort: auto-fixes safe drifts and escalates any 🔴 into the
+    #     REPORT ONLY (do_fix=False) — auto-fix is opt-in via
+    #     `python scripts/deep_health_check.py --fix`. Escalates any 🔴 into the
     #     08:00 report. Never breaks the core check (wrapped).
     try:
         from scripts.deep_health_check import run_deep_health_check
-        deep = run_deep_health_check(light=True, do_fix=True)
+        deep = run_deep_health_check(light=True, do_fix=False)
         if deep.get("alert"):
             issues.append(f"Deep check (light): {deep['alert']} 項 🔴 — 見 log")
-        for fx in deep.get("fixes", []):
-            logger.info("deep auto-fix: %s", fx)
     except Exception as exc:
         logger.debug("deep_health_check (light) skipped: %s", exc)
 

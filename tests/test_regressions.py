@@ -46,7 +46,8 @@ class TestRegressionBrokerCertParams:
                     )
 
     def test_daily_updater_has_cert(self):
-        src = Path("src/data/daily_updater.py").read_text()
+        # Adapter creation (incl. cert params) now lives in the unified fetcher.
+        src = Path("src/data/shioaji_fetcher.py").read_text()
         assert "cert_path" in src
         assert "cert_password" in src
         assert "person_id" in src

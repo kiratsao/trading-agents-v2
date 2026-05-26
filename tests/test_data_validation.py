@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data import daily_updater
 from src.data.validation import (
     CloseDiff,
-    validate_and_override_with_shioaji,
+    compare_to_shioaji,
     validate_latest_bar,
 )
 
@@ -82,42 +82,37 @@ def test_validate_latest_bar_both_dead_is_ok():
     assert validate_latest_bar(d, 20_000.0, shioaji_fetch=boom, taifex_fetch=boom)[0] == "ok"
 
 
-# ── B1: validate_and_override_with_shioaji ──────────────────────────────────
-def test_b1_overrides_divergent_bar_with_shioaji():
+# ── compare_to_shioaji (report-only — never mutates) ────────────────────────
+def test_compare_flags_divergent_bar_without_mutating():
     idx = pd.DatetimeIndex([pd.Timestamp(d) for d in
                             (date(2026, 5, 19), date(2026, 5, 20), date(2026, 5, 21))], name="date")
     df = pd.DataFrame({"open": [1, 2, 3], "high": [1, 2, 3], "low": [1, 2, 3],
                        "close": [20_000.0, 20_500.0, 21_000.0], "volume": [1, 2, 3]}, index=idx)
 
     def shioaji(a, b):
-        # 5/20 diverges by 400pt; the other two agree
-        rows = {date(2026, 5, 19): 20_000.0, date(2026, 5, 20): 20_900.0,
-                date(2026, 5, 21): 21_000.0}
+        rows = {date(2026, 5, 19): (20_000.0, 90_000), date(2026, 5, 20): (20_900.0, 95_000),
+                date(2026, 5, 21): (21_000.0, 90_000)}
         return pd.DataFrame(
-            [{"open": c, "high": c, "low": c, "close": c, "volume": 9} for c in rows.values()],
+            [{"open": c, "high": c, "low": c, "close": c, "volume": v} for c, v in rows.values()],
             index=pd.DatetimeIndex([pd.Timestamp(d) for d in rows], name="date"),
         )
 
-    logs: list[str] = []
-    out, overridden = validate_and_override_with_shioaji(
-        df, recent_days=20, shioaji_fetch=shioaji, threshold=50.0, log=logs.append,
-    )
-    assert [cd.day for cd in overridden] == [date(2026, 5, 20)]
-    assert out.loc[pd.Timestamp("2026-05-20"), "close"] == 20_900.0   # overridden
-    assert out.loc[pd.Timestamp("2026-05-21"), "close"] == 21_000.0   # untouched
-    assert any("用 Shioaji 覆蓋" in m for m in logs)
+    diffs, ref = compare_to_shioaji(df, recent_days=20, shioaji_fetch=shioaji, threshold=50.0)
+    assert [cd.day for cd in diffs] == [date(2026, 5, 20)]
+    assert diffs[0].ref_close == 20_900.0
+    assert diffs[0].ref_volume == 95_000          # volume carried for safety valve
+    assert df.loc[pd.Timestamp("2026-05-20"), "close"] == 20_500.0   # df NOT mutated
 
 
-def test_b1_no_override_when_agree():
+def test_compare_no_diff_when_agree():
     idx = pd.DatetimeIndex([pd.Timestamp("2026-05-21")], name="date")
     df = pd.DataFrame(
         {"open": [1], "high": [1], "low": [1], "close": [21_000.0], "volume": [1]}, index=idx,
     )
-    out, overridden = validate_and_override_with_shioaji(
+    diffs, _ = compare_to_shioaji(
         df, shioaji_fetch=lambda a, b: _ref(date(2026, 5, 21), 21_020.0), threshold=50.0,
     )
-    assert overridden == []
-    assert out.loc[pd.Timestamp("2026-05-21"), "close"] == 21_000.0
+    assert diffs == []
 
 
 # ── B2 wired into daily_updater.update() ────────────────────────────────────
@@ -199,3 +194,27 @@ def test_update_all_iterates_products_and_skips_non_mxf(tmp_path):
     assert by_product["MXF"]["success"] is True and by_product["MXF"]["bars_added"] == 1
     assert by_product["2330"].get("skipped") is True
     assert len(calls) == 1  # only MXF went through update()
+
+
+# ── unification: validation routes through the single fetcher ───────────────
+def test_validation_default_fetch_uses_shioaji_fetcher(monkeypatch):
+    import src.data.shioaji_fetcher as sf
+    from src.data.validation import _default_shioaji_fetch
+
+    sentinel = pd.DataFrame({"close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp("2026-05-15")]))
+    monkeypatch.setattr(sf, "fetch_via_env", lambda s, e, product="MXF": sentinel)
+    out = _default_shioaji_fetch(date(2026, 5, 15), date(2026, 5, 15))
+    assert out is sentinel
+
+
+# ── init_data holiday filtering no longer crashes ──────────────────────────
+def test_init_data_remove_holidays_no_crash():
+    from scripts.init_data import _remove_taifex_holidays
+
+    idx = pd.DatetimeIndex([pd.Timestamp("2026-04-30"), pd.Timestamp("2026-05-01"),
+                            pd.Timestamp("2026-05-04")], name="date")  # 5/1 = 勞動節
+    df = pd.DataFrame({"open": [1, 2, 3], "high": [1, 2, 3], "low": [1, 2, 3],
+                       "close": [1.0, 2, 3], "volume": [1, 2, 3]}, index=idx)
+    out = _remove_taifex_holidays(df)
+    assert pd.Timestamp("2026-05-01") not in out.index   # holiday dropped
+    assert len(out) == 2
