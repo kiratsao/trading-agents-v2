@@ -13,23 +13,94 @@ accounts:
       atr_stop_mult: 2.0
       confirm_days: 2
       adx_threshold: 25
+    # Ladder built ONCE to equity = 10,000,000 by a fixed rule — never hand-tune:
+    #   起始 350K → 2 口；每 +120K equity → +1 口（350K=2, 470K=3, …, 9.95M=82）。
+    # 口數最終由 equity/margin 決定：實際口數 = min(ladder, floor(equity/margin), max_contracts)。
+    # margin_per_contract=131,500 → 10M equity 的 margin cap ≈ 76 口（先於 ladder 綁定）。
     scale_ladder:
-      - {equity:  350000, contracts: 2}
-      - {equity:  480000, contracts: 3}
-      - {equity:  600000, contracts: 4}
-      - {equity:  720000, contracts: 5}
-      - {equity:  840000, contracts: 6}
-      - {equity:  960000, contracts: 7}
-      - {equity: 1080000, contracts: 8}
-      - {equity: 1200000, contracts: 9}
-      - {equity: 1320000, contracts: 10}
-      - {equity: 1440000, contracts: 11}
-      - {equity: 1560000, contracts: 12}
-      - {equity: 1680000, contracts: 13}
-      - {equity: 1800000, contracts: 14}
-      - {equity: 1920000, contracts: 15}
+      - {equity:    350000, contracts: 2}
+      - {equity:    470000, contracts: 3}
+      - {equity:    590000, contracts: 4}
+      - {equity:    710000, contracts: 5}
+      - {equity:    830000, contracts: 6}
+      - {equity:    950000, contracts: 7}
+      - {equity:   1070000, contracts: 8}
+      - {equity:   1190000, contracts: 9}
+      - {equity:   1310000, contracts: 10}
+      - {equity:   1430000, contracts: 11}
+      - {equity:   1550000, contracts: 12}
+      - {equity:   1670000, contracts: 13}
+      - {equity:   1790000, contracts: 14}
+      - {equity:   1910000, contracts: 15}
+      - {equity:   2030000, contracts: 16}
+      - {equity:   2150000, contracts: 17}
+      - {equity:   2270000, contracts: 18}
+      - {equity:   2390000, contracts: 19}
+      - {equity:   2510000, contracts: 20}
+      - {equity:   2630000, contracts: 21}
+      - {equity:   2750000, contracts: 22}
+      - {equity:   2870000, contracts: 23}
+      - {equity:   2990000, contracts: 24}
+      - {equity:   3110000, contracts: 25}
+      - {equity:   3230000, contracts: 26}
+      - {equity:   3350000, contracts: 27}
+      - {equity:   3470000, contracts: 28}
+      - {equity:   3590000, contracts: 29}
+      - {equity:   3710000, contracts: 30}
+      - {equity:   3830000, contracts: 31}
+      - {equity:   3950000, contracts: 32}
+      - {equity:   4070000, contracts: 33}
+      - {equity:   4190000, contracts: 34}
+      - {equity:   4310000, contracts: 35}
+      - {equity:   4430000, contracts: 36}
+      - {equity:   4550000, contracts: 37}
+      - {equity:   4670000, contracts: 38}
+      - {equity:   4790000, contracts: 39}
+      - {equity:   4910000, contracts: 40}
+      - {equity:   5030000, contracts: 41}
+      - {equity:   5150000, contracts: 42}
+      - {equity:   5270000, contracts: 43}
+      - {equity:   5390000, contracts: 44}
+      - {equity:   5510000, contracts: 45}
+      - {equity:   5630000, contracts: 46}
+      - {equity:   5750000, contracts: 47}
+      - {equity:   5870000, contracts: 48}
+      - {equity:   5990000, contracts: 49}
+      - {equity:   6110000, contracts: 50}
+      - {equity:   6230000, contracts: 51}
+      - {equity:   6350000, contracts: 52}
+      - {equity:   6470000, contracts: 53}
+      - {equity:   6590000, contracts: 54}
+      - {equity:   6710000, contracts: 55}
+      - {equity:   6830000, contracts: 56}
+      - {equity:   6950000, contracts: 57}
+      - {equity:   7070000, contracts: 58}
+      - {equity:   7190000, contracts: 59}
+      - {equity:   7310000, contracts: 60}
+      - {equity:   7430000, contracts: 61}
+      - {equity:   7550000, contracts: 62}
+      - {equity:   7670000, contracts: 63}
+      - {equity:   7790000, contracts: 64}
+      - {equity:   7910000, contracts: 65}
+      - {equity:   8030000, contracts: 66}
+      - {equity:   8150000, contracts: 67}
+      - {equity:   8270000, contracts: 68}
+      - {equity:   8390000, contracts: 69}
+      - {equity:   8510000, contracts: 70}
+      - {equity:   8630000, contracts: 71}
+      - {equity:   8750000, contracts: 72}
+      - {equity:   8870000, contracts: 73}
+      - {equity:   8990000, contracts: 74}
+      - {equity:   9110000, contracts: 75}
+      - {equity:   9230000, contracts: 76}
+      - {equity:   9350000, contracts: 77}
+      - {equity:   9470000, contracts: 78}
+      - {equity:   9590000, contracts: 79}
+      - {equity:   9710000, contracts: 80}
+      - {equity:   9830000, contracts: 81}
+      - {equity:   9950000, contracts: 82}
     margin_per_contract: 131500   # TAIFEX 2026-04-27 調整
-    max_contracts: 15
+    max_contracts: 999            # 無硬上限 — 由 floor(equity/margin) 與券商額度自然限制
     settlement_force_close: true
     sessions:
       day:
