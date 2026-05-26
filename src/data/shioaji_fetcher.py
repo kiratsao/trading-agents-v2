@@ -23,8 +23,15 @@ logger = logging.getLogger(__name__)
 _DAY_OPEN = time(8, 45)
 _DAY_CLOSE = time(13, 45)        # normal day session ends 13:44:59
 _SETTLE_CLOSE = time(13, 30)     # settlement day regular session ends 13:30
-_VOLUME_FLOOR = 30_000           # a real MXF day session trades well above this
 _KBARS_TIMEOUT = 30_000
+
+# Volume is a WARNING signal only — NEVER a gate. MXFR1 is a rolling near-month
+# contract, so a historical query returns the *new* contract's (low) volume for
+# that day (e.g. 05/15 → June contract's ~1,222, not May's ~198,312). Gating on
+# volume wrongly dropped valid day-session bars. The 08:45–13:45 time filter is
+# the real defense: a real day session (even a non-main contract) is > ~1,000,
+# while night/anomaly bars are < ~500 and already excluded by the time filter.
+_VOLUME_WARN = 1_000
 
 
 def fetch_day_session_bar(
@@ -33,13 +40,14 @@ def fetch_day_session_bar(
     day: date,
     *,
     timeout: int = _KBARS_TIMEOUT,
-    volume_floor: int = _VOLUME_FLOOR,
+    volume_warn: int = _VOLUME_WARN,
 ) -> dict | None:
     """Authoritative single-day day-session OHLCV from Shioaji 1-min kbars.
 
-    Returns ``{open, high, low, close, volume}`` or ``None`` when there is no
-    day-session data or volume looks too low to be a complete session (a guard
-    against partial / wrong fetches silently producing a bad bar).
+    Returns ``{open, high, low, close, volume}``, or ``None`` only when there is
+    no day-session data at all (empty kbars / no bars in 08:45–close). Volume is
+    NOT a gate — a low volume only logs a warning (see ``_VOLUME_WARN``), because
+    rolling-contract historical queries legitimately report low volume.
     """
     try:
         kbars = api.kbars(contract, start=str(day), end=str(day), timeout=timeout)
@@ -74,12 +82,12 @@ def fetch_day_session_bar(
         "close": float(sess.iloc[-1]["close"]),
         "volume": int(sess["volume"].sum()),
     }
-    if bar["volume"] <= volume_floor:
+    if bar["volume"] < volume_warn:
         logger.warning(
-            "fetch_day_session_bar: %s volume=%d ≤ %d — 疑似非完整日盤，回傳 None",
-            day, bar["volume"], volume_floor,
+            "fetch_day_session_bar: %s volume=%d < %d — 量偏低（可能為滾動合約歷史量），"
+            "仍回傳；交叉驗證請以 TAIFEX 為準",
+            day, bar["volume"], volume_warn,
         )
-        return None
     return bar
 
 

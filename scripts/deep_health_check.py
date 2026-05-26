@@ -38,9 +38,13 @@ _CLOSE_JUMP_PCT = 10.0          # |Δclose| beyond this is flagged (not auto-fix
 _EQUITY_DRIFT_PCT = 5.0         # state.equity vs broker beyond this → auto-fix
 _ENTRY_DRIFT_PTS = 50.0         # state.entry_price vs broker beyond this → auto-fix
 # Round-2 parquet override is the dangerous one (it once rewrote correct data
-# with a buggy Shioaji value). Override ONLY when both hold:
+# with a buggy Shioaji value). Override ONLY a RELIABLE ref AND a big diff:
 _OVERRIDE_MIN_DIFF = 200.0      # < 200pt may be benign (settle price vs last trade)
-_OVERRIDE_MIN_VOLUME = 30_000   # ref must look like a real, complete day session
+# A low-volume Shioaji ref means MXFR1 returned rolling-contract historical data
+# (the wrong contract), NOT the contract that actually traded that day — so it
+# cannot be trusted to validate/override. TAIFEX is ground truth; Shioaji is
+# auxiliary and only trusted when the ref looks like a real main-contract session.
+_RELIABLE_REF_VOLUME = 30_000
 
 
 @dataclass
@@ -140,12 +144,13 @@ def round2_shioaji_cross(
     do_fix: bool = False,
     notify_fn=None,
 ) -> tuple[list[Check], pd.DataFrame, list[str]]:
-    """Compare recent parquet closes vs Shioaji. Auto-fix is OFF by default and,
-    even with --fix, ONLY overrides a bar when the divergence is large
-    (> _OVERRIDE_MIN_DIFF pt) AND the reference is a real day session
-    (volume > _OVERRIDE_MIN_VOLUME) — small diffs are likely the benign
-    settlement-price vs last-trade gap and are left alone. The original parquet
-    is backed up first and every override emits a LINE notice."""
+    """Compare recent parquet closes vs Shioaji. Shioaji is AUXILIARY only —
+    TAIFEX is ground truth. A low-volume ref means MXFR1 returned rolling-
+    contract historical data (the wrong contract) and is treated as unreliable
+    → skipped, not flagged as an error. Auto-fix is OFF by default; even with
+    --fix a bar is overridden ONLY when the ref is reliable
+    (volume ≥ _RELIABLE_REF_VOLUME) AND the divergence is large (> 200pt).
+    The original parquet is backed up first and every override emits a LINE notice."""
     from src.data.validation import compare_to_shioaji
 
     R = 2
@@ -160,9 +165,18 @@ def round2_shioaji_cross(
         return [Check(R, "Shioaji 交叉驗證", "ok",
                       f"近 {recent_days} 天 close 差距 < 50 點")], df, []
 
-    fixable = [cd for cd in diffs
-               if cd.ref_volume > _OVERRIDE_MIN_VOLUME and cd.diff > _OVERRIDE_MIN_DIFF]
-    skipped = [cd for cd in diffs if cd not in fixable]
+    # A low-volume ref is rolling-contract historical data → can't trust it.
+    reliable = [cd for cd in diffs if cd.ref_volume >= _RELIABLE_REF_VOLUME]
+    unreliable = [cd for cd in diffs if cd.ref_volume < _RELIABLE_REF_VOLUME]
+
+    if not reliable:
+        # Every divergence sits on an unreliable (rolling-contract) ref → skip.
+        return [Check(R, "Shioaji 交叉驗證", "skip",
+                      f"{len(unreliable)} 筆差異但 ref volume 過低（滾動合約歷史量），"
+                      f"無法可靠驗證；以 TAIFEX 為準")], df, []
+
+    fixable = [cd for cd in reliable if cd.diff > _OVERRIDE_MIN_DIFF]
+    small = [cd for cd in reliable if cd not in fixable]
 
     fixes: list[str] = []
     if do_fix and fixable and parquet_path is not None:
@@ -190,12 +204,14 @@ def round2_shioaji_cross(
             return [Check(R, "Shioaji 交叉驗證", "alert",
                           f"{len(fixable)} 筆待覆蓋，寫入失敗: {exc}")], df, []
 
-    parts = [f"{len(diffs)} 筆 > 50 點"]
+    parts = [f"{len(reliable)} 筆可靠差異 > 50 點"]
     if fixes:
-        parts.append(f"{len(fixes)} 筆已覆蓋(>200點且日盤量足，已備份)")
-    if skipped:
-        parts.append(f"{len(skipped)} 筆未動(差<200點或量不足，疑正常價差)")
-    elif not do_fix and fixable:
+        parts.append(f"{len(fixes)} 筆已覆蓋(>200點，已備份)")
+    if small:
+        parts.append(f"{len(small)} 筆差<200點未動(疑正常價差)")
+    if unreliable:
+        parts.append(f"{len(unreliable)} 筆 ref量過低跳過")
+    if not do_fix and fixable:
         parts.append(f"{len(fixable)} 筆可覆蓋，需 --fix 啟用")
     return [Check(R, "Shioaji 交叉驗證", "warn", "; ".join(parts))], df, fixes
 

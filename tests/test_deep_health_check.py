@@ -178,15 +178,17 @@ def test_deep_health_auto_fix_off_by_default(tmp_path):
     assert checks[0].status == "warn"
 
 
-def test_deep_health_fix_requires_high_volume(tmp_path):
+def test_deep_health_low_volume_ref_skips_not_overrides(tmp_path):
     p = tmp_path / "p.parquet"
     df = write_synthetic_parquet(p, n_bars=30, end=date(2026, 5, 21))
-    # big diff but ref volume below floor → NOT a real day session → no override
+    # big diff but ref volume below reliability cutoff = rolling-contract data →
+    # cannot trust → ⏭️ skip, never override, even with --fix.
     checks, _, fixes = round2_shioaji_cross(
-        df, parquet_path=p, shioaji_fetch=_diverge_factory(df, delta=400, volume=100),
+        df, parquet_path=p, shioaji_fetch=_diverge_factory(df, delta=400, volume=1_222),
         do_fix=True)
     assert fixes == []
     assert not list(tmp_path.glob("parquet_backup_*.parquet"))
+    assert checks[0].status == "skip"            # unreliable ref → skip, not error/warn
 
 
 def test_deep_health_fix_skips_small_diff(tmp_path):

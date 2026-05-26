@@ -64,11 +64,16 @@ def test_fetcher_settlement_day_excludes_1330(monkeypatch):
     assert bar["volume"] == 40_000
 
 
-def test_fetcher_low_volume_returns_none():
+def test_fetcher_low_volume_still_returns_bar():
+    # Rolling-contract historical queries report low volume — that is NOT a
+    # reason to drop a valid day-session bar. Volume only warns; bar returned.
     api = _Api(_kbars([
-        ("2026-05-15 09:00", 41_000, 41_010, 40_990, 41_005, 100),  # < 30,000 floor
+        ("2026-05-15 09:00", 41_000, 41_010, 40_990, 41_005, 1_222),  # rolling-contract量
     ]))
-    assert fetch_day_session_bar(api, None, date(2026, 5, 15)) is None
+    bar = fetch_day_session_bar(api, None, date(2026, 5, 15))
+    assert bar is not None
+    assert bar["close"] == 41_005
+    assert bar["volume"] == 1_222
 
 
 def test_fetcher_end_not_plus_one():
