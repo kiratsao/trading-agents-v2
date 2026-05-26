@@ -150,15 +150,13 @@ def validate_and_override_with_shioaji(
     if not days:
         return df, []
 
+    # Fetch failures propagate so the CALLER decides (init_data prints "skipped",
+    # deep_health_check Round 2 reports ⏭️) — silently returning "no diffs" here
+    # would masquerade an unreachable oracle as a clean validation.
     fetch = shioaji_fetch or _default_shioaji_fetch
-    try:
-        ref = fetch(days[0], days[-1])
-    except Exception as exc:
-        emit(f"⚠️ B1 cross-validation skipped — Shioaji fetch failed: {exc}")
-        return df, []
+    ref = fetch(days[0], days[-1])
     if ref is None or len(ref) == 0:
-        emit("⚠️ B1 cross-validation skipped — Shioaji returned no data")
-        return df, []
+        raise ValueError("Shioaji returned no reference data")
 
     ref = _normalize(ref)
     overridden: list[CloseDiff] = []
