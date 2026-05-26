@@ -223,6 +223,26 @@ def test_case7_data_gap_backfill(tmp_path):
     assert any("⚠️" in m and "需手動處理" in m for m in msgs2)
 
 
+# ── _check_data_freshness: trading-day aware (not pd.bdate_range) ───────────
+def test_check_data_freshness_counts_trading_days(tmp_path):
+    from src.data.tw_holidays import last_trading_day_before
+
+    orch, _, _, _ = _make(tmp_path, [Signal("hold", 0, "x")])
+    today = pd.Timestamp.now(tz="Asia/Taipei").date()
+
+    def df_latest(d):
+        return pd.DataFrame({"close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp(d)]))
+
+    d1 = last_trading_day_before(today)               # 1 trading day back → fresh
+    assert orch._check_data_freshness(df_latest(d1)) is None
+
+    d4 = d1
+    for _ in range(3):
+        d4 = last_trading_day_before(d4)              # 4 back → 3 trading days gap
+    msg = orch._check_data_freshness(df_latest(d4))
+    assert msg is not None and "過期" in msg
+
+
 # ── Case 8: Monday-morning health check, no false alarm ─────────────────────
 def test_case8_monday_morning_no_false_alarm(tmp_path):
     # 週一 08:00, latest = 上週四 → ✅ (pre-14:25 slack)

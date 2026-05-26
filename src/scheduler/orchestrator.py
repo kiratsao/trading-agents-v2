@@ -622,12 +622,16 @@ class V2bOrchestrator:
             return "🔴 資料防護: parquet 為空"
         latest = df.index[-1].date()
         today = pd.Timestamp.now(tz="Asia/Taipei").date()
-        # Count business days between latest and today
-        bdays = len(pd.bdate_range(latest, today, inclusive="neither"))
-        if bdays > 2:
+        # Trading days strictly between latest and today, per the TAIFEX
+        # calendar (excludes weekends AND holidays — pd.bdate_range counted
+        # holidays as trading days and over-reported staleness).
+        from src.data.tw_holidays import trading_days_between
+
+        gap = sum(1 for d in trading_days_between(latest, today) if latest < d < today)
+        if gap > 2:
             return (
                 f"⚠️ 資料可能過期: parquet 最新={latest}, "
-                f"今天={today}, 差 {bdays} 個交易日"
+                f"今天={today}, 差 {gap} 個交易日"
             )
         return None
 

@@ -39,6 +39,7 @@ data/drawdown_state.json
 data/equity_history.json
 data/execution_log.json
 data/tw_execution_log.json
+data/state_backup_*.json
 data/reports/
 data/synthetic/
 
