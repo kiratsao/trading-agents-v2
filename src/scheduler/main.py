@@ -64,46 +64,76 @@ def _load_config(config_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _build_orchestrator(cfg: dict, live: bool = False):
+def _data_path_for(product: str) -> Path:
+    """Canonical parquet path for a product (matches scripts/init_data.py)."""
+    return Path(f"data/{product}_Daily_Clean_2020_to_now.parquet")
+
+
+def _build_orchestrators(cfg: dict, live: bool = False) -> dict:
+    """Build one V2bOrchestrator per account in cfg['accounts'].
+
+    Returns dict[account_name → V2bOrchestrator]. All accounts share a single
+    notifier instance so one LINE channel sees everything.
+    """
     from src.scheduler.orchestrator import V2bOrchestrator
     from src.state.state_manager import StateManager
     from src.strategy.v2b_engine import V2bEngine
 
-    acc = cfg["accounts"]["aggressive"]
-    params = acc.get("strategy_params", {})
-    ladder = [
-        {"equity": entry["equity"], "contracts": entry["contracts"]}
-        for entry in acc.get("scale_ladder", [])
-    ]
-
-    engine = V2bEngine(
-        product="MXF",
-        ema_fast=params.get("ema_fast", 30),
-        ema_slow=params.get("ema_slow", 100),
-        trail_atr_mult=params.get("atr_stop_mult", 2.0),
-        confirm_days=params.get("confirm_days", 2),
-        adx_threshold=params.get("adx_threshold", 25),
-        ladder=ladder,
-        max_contracts=acc.get("max_contracts"),
-        margin_per_contract=acc.get("margin_per_contract"),
-    )
-    state_mgr = StateManager(path="data/paper_state.json")
     notify_fn = _build_notifier()
+    orchestrators: dict = {}
 
-    sessions = acc.get("sessions", {})
-    day_cfg = sessions.get("day", {})
-    execution_timing = day_cfg.get("execution_timing", "next_open")
-    decision_time = day_cfg.get("decision_time", "14:30")
+    for name, acc in cfg.get("accounts", {}).items():
+        product = acc.get("product", "MXF")
+        params = acc.get("strategy_params", {})
+        ladder = [
+            {"equity": entry["equity"], "contracts": entry["contracts"]}
+            for entry in acc.get("scale_ladder", [])
+        ]
 
-    return V2bOrchestrator(
-        strategy=engine,
-        state_mgr=state_mgr,
-        notify_fn=notify_fn,
-        enable_tsmc_signal=day_cfg.get("enable_tsmc_signal", False),
-        decision_time=decision_time,
-        execution_timing=execution_timing,
-        live=live,
-    )
+        engine = V2bEngine(
+            product=product,
+            ema_fast=params.get("ema_fast", 30),
+            ema_slow=params.get("ema_slow", 100),
+            trail_atr_mult=params.get("atr_stop_mult", 2.0),
+            confirm_days=params.get("confirm_days", 2),
+            adx_threshold=params.get("adx_threshold", 25),
+            ladder=ladder,
+            max_contracts=acc.get("max_contracts"),
+            margin_per_contract=acc.get("margin_per_contract"),
+        )
+        # Per-account override of the product-level default for settlement
+        # behavior (e.g. you could disable rollover for an MXF account that
+        # holds across expiry intentionally).
+        if "settlement_force_close" in acc:
+            engine.settlement_force_close = bool(acc["settlement_force_close"])
+
+        state_mgr = StateManager(
+            path=f"data/state_{name}.json",
+            initial_equity=float(acc.get("equity", 350_000)),
+        )
+
+        sessions = acc.get("sessions", {})
+        day_cfg = sessions.get("day", {})
+
+        orchestrators[name] = V2bOrchestrator(
+            strategy=engine,
+            state_mgr=state_mgr,
+            notify_fn=notify_fn,
+            enable_tsmc_signal=day_cfg.get("enable_tsmc_signal", False),
+            data_path=_data_path_for(product),
+            decision_time=day_cfg.get("decision_time", "14:30"),
+            execution_timing=day_cfg.get("execution_timing", "next_open"),
+            live=live,
+        )
+        logger.info(
+            "built account %s: product=%s state=%s data=%s timing=%s",
+            name, product, state_mgr.path, _data_path_for(product),
+            day_cfg.get("execution_timing", "next_open"),
+        )
+
+    if not orchestrators:
+        raise SystemExit("No accounts found in config — check accounts.yaml")
+    return orchestrators
 
 
 # ---------------------------------------------------------------------------
@@ -229,135 +259,73 @@ def _query_live_equity(broker) -> tuple[float, str]:
 
 
 def _send_startup_notification(
-    orchestrator, notify_fn, mode: str, broker=None
+    orchestrators: dict, notify_fn, mode: str, broker=None
 ) -> None:
-    """Send startup notification with current position and schedule info."""
-    try:
-        state = orchestrator.state_mgr.load()
-        position_str = (
-            f"{state.position}口 @ {state.entry_price:,.0f}"
-            if state.position > 0
-            else "空倉"
-        )
+    """Send a single multi-account startup notification.
 
-        # Try to get latest price from Shioaji or parquet
-        latest_price = _get_latest_price(orchestrator, live=mode == "LIVE")
-
-        timing = orchestrator.execution_timing
-        if timing == "night_open":
-            schedule_str = "14:30 信號 + 15:05 下單"
-        else:
-            schedule_str = "14:30 信號+下單"
-
-        # Query real-time equity from broker if live
-        live_equity, equity_src = _query_live_equity(broker)
-        if live_equity > 0:
-            equity_val = live_equity
-        else:
-            equity_val = state.equity
-            equity_src = "估算"
-
-        # Unrealized PnL (if holding)
-        pnl_line = ""
-        if state.position > 0 and state.entry_price:
-            # Try to parse last close from latest_price string
-            try:
-                last_close = float(latest_price.split(" ")[0].replace(",", ""))
-                tick_val = 50.0  # MXF
-                unrealized = (last_close - state.entry_price) * state.position * tick_val
-                pct = (unrealized / equity_val * 100) if equity_val > 0 else 0.0
-                icon = "🟢" if unrealized >= 0 else "🔴"
-                pnl_line = f"持倉損益: {icon} {unrealized:+,.0f} NTD ({pct:+.1f}%)"
-            except (ValueError, IndexError):
-                pass
-
-        lines = [
-            "🚀 trading-agents-v2 啟動",
-            "━━━━━━━━━━━━",
-            f"模式: {mode}",
-            f"台指即時: {latest_price}",
-            f"目前持倉: {position_str}",
-        ]
-        if pnl_line:
-            lines.append(pnl_line)
-        lines += [
-            f"帳戶淨值: {equity_val:,.0f} NTD ({equity_src})",
-            f"排程: {schedule_str}",
-            "━━━━━━━━━━━━",
-        ]
-        msg = "\n".join(lines)
-        notify_fn(msg)
-        logger.info("Startup notification sent.")
-    except Exception as exc:
-        logger.warning("Startup notification failed: %s", exc)
-
-
-def _get_latest_price(orchestrator, live: bool = False) -> str:
-    """Try Shioaji live snapshot first, fallback to last parquet bar.
-
-    Priority:
-      1. ShioajiAdapter.get_snapshots("MXF") → snap["close"]  (即時 last price)
-      2. Parquet last close (with multi-path fallback)
-      3. "N/A"
+    One LINE message lists every configured account: product, position, and
+    last close from its product-specific parquet. Per-account live snapshot
+    via Shioaji is deferred to Step 5/6 — the snapshot helper is still
+    MXF-hardcoded.
     """
-    # 1. Try Shioaji snapshot via ShioajiAdapter (live mode only — simulation mode skips
-    #    Shioaji to avoid segfault from rapid connect/disconnect in the C extension)
-    try:
-        import os
-
-        api_key = os.environ.get("SHIOAJI_API_KEY", "")
-        secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "")
-        if live and api_key and secret_key:
-            from tw_futures.executor.shioaji_adapter import ShioajiAdapter
-
-            adapter = ShioajiAdapter(
-                api_key=api_key,
-                secret_key=secret_key,
-                simulation=False,
-                cert_path=os.environ.get("SHIOAJI_CERT_PATH") or None,
-                cert_password=os.environ.get("SHIOAJI_CERT_PASSWORD") or None,
-                person_id=os.environ.get("SHIOAJI_PERSON_ID") or None,
-            )
-            snap = adapter.get_snapshots("MXF")
-            adapter.logout()
-            close = snap.get("close") or snap.get("last_price")
-            ts = snap.get("ts")
-            if close:
-                if ts:
-                    import pandas as pd
-
-                    ts_dt = pd.Timestamp(ts, unit="ns").tz_localize("Asia/Taipei")
-                    ts_str = ts_dt.strftime("%m/%d %H:%M")
-                else:
-                    ts_str = "即時"
-                return f"{close:,.0f} ({ts_str})"
-    except Exception as exc:
-        logger.debug("_get_latest_price Shioaji snapshot failed: %s", exc)
-        pass
-
-    # 2. Fallback to parquet last bar (try multiple paths)
     try:
         from pathlib import Path
 
         import pandas as pd
 
-        candidates = [
-            orchestrator.data_path,
-            Path("data/MXF_Daily_Clean_2020_to_now.parquet"),
-            Path.home() / "trading-agents-v2" / "data" / "MXF_Daily_Clean_2020_to_now.parquet",
-        ]
-        for data_path in candidates:
-            if data_path.exists():
-                df = pd.read_parquet(data_path)
-                if len(df) > 0:
-                    last_close = float(df["close"].iloc[-1])
-                    last_date = df.index[-1]
-                    return f"{last_close:,.0f} ({last_date:%Y-%m-%d} 收盤)"
-                break
-    except Exception:
-        pass
+        timings = {o.execution_timing for o in orchestrators.values()}
+        if timings == {"night_open"}:
+            schedule_str = "14:30 信號 + 15:05 下單"
+        elif timings == {"next_open"}:
+            schedule_str = "14:30 信號+下單"
+        else:
+            schedule_str = "/".join(sorted(timings))
 
-    return "N/A"
+        lines = [
+            "🚀 trading-agents-v2 啟動",
+            "━━━━━━━━━━━━",
+            f"模式: {mode}",
+            f"帳戶數: {len(orchestrators)}",
+            f"排程: {schedule_str}",
+            "━━━━━━━━━━━━",
+        ]
+
+        for name, orch in orchestrators.items():
+            state = orch.state_mgr.load()
+            product = orch.strategy.product
+            position_str = (
+                f"{state.position}口 @ {state.entry_price:,.0f}"
+                if state.position > 0
+                else "空倉"
+            )
+
+            # Last close from this account's parquet
+            last_close: float | None = None
+            try:
+                if Path(orch.data_path).exists():
+                    df = pd.read_parquet(orch.data_path)
+                    if len(df) > 0:
+                        last_close = float(df["close"].iloc[-1])
+            except Exception:
+                pass
+
+            lines.append(f"[{name} · {product}]")
+            if last_close is not None:
+                lines.append(f"  最新收盤: {last_close:,.2f}")
+            lines.append(f"  持倉: {position_str}")
+            if state.position > 0 and state.entry_price and last_close is not None:
+                tick_val = orch.strategy.point_value
+                unrealized = (last_close - state.entry_price) * state.position * tick_val
+                pct = (unrealized / state.equity * 100) if state.equity > 0 else 0.0
+                icon = "🟢" if unrealized >= 0 else "🔴"
+                lines.append(f"  持倉損益: {icon} {unrealized:+,.0f} NTD ({pct:+.1f}%)")
+            lines.append(f"  淨值: {state.equity:,.0f} NTD")
+
+        lines.append("━━━━━━━━━━━━")
+        notify_fn("\n".join(lines))
+        logger.info("Startup notification sent (%d accounts).", len(orchestrators))
+    except Exception as exc:
+        logger.warning("Startup notification failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -379,40 +347,53 @@ def main(argv=None) -> None:
 
     cfg = _load_config(args.config)
     is_live = args.live
-    orchestrator = _build_orchestrator(cfg, live=is_live)
-    notify_fn = orchestrator.notify_fn
+    orchestrators = _build_orchestrators(cfg, live=is_live)
+    # All orchestrators share one notifier (built once inside _build_orchestrators).
+    notify_fn = next(iter(orchestrators.values())).notify_fn
 
     # ── Startup notification ──────────────────────────────────────────
     startup_broker = _build_broker(is_live)
-    _send_startup_notification(orchestrator, notify_fn, mode, broker=startup_broker)
+    _send_startup_notification(orchestrators, notify_fn, mode, broker=startup_broker)
     if startup_broker:
         startup_broker.logout()
+
+    # Partition accounts by execution timing — each timing has its own cron set.
+    night_accounts = {
+        n: o for n, o in orchestrators.items() if o.execution_timing == "night_open"
+    }
+    next_open_accounts = {
+        n: o for n, o in orchestrators.items() if o.execution_timing == "next_open"
+    }
 
     # ── Run-once mode ─────────────────────────────────────────────────
     if run_once:
         broker = _build_broker(is_live)
         try:
-            if orchestrator.execution_timing == "night_open":
+            if night_accounts:
                 logger.info("── run-once night_open: Phase 1 (signal) ──")
-                sig_result = orchestrator.run_signal(broker=broker)
-                logger.info("run_signal result: %s", sig_result)
-                print("\n  [14:30 signal]")
-                print(f"  action   : {sig_result.get('action')}")
-                print(f"  contracts: {sig_result.get('contracts', 0)}")
-                print(f"  reason   : {sig_result.get('reason')}")
+                for name, orch in night_accounts.items():
+                    sig_result = orch.run_signal(broker=broker)
+                    logger.info("run_signal[%s] result: %s", name, sig_result)
+                    print(f"\n  [14:30 signal · {name}]")
+                    print(f"  action   : {sig_result.get('action')}")
+                    print(f"  contracts: {sig_result.get('contracts', 0)}")
+                    print(f"  reason   : {sig_result.get('reason')}")
 
                 logger.info("── run-once night_open: Phase 2 (execution) ──")
-                exec_result = orchestrator.run_execution(broker=broker)
-                logger.info("run_execution result: %s", exec_result)
-                print("\n  [15:05 execution]")
-                print(f"  action   : {exec_result.get('action')}")
-                if "pnl_twd" in exec_result:
-                    print(f"  pnl_twd  : {exec_result['pnl_twd']:.0f} NTD")
-            else:
-                logger.info("── run-once mode: executing one daily cycle ──")
-                result = orchestrator.run_daily(broker=broker)
-                logger.info("run_daily result: %s", result)
-                print(f"\n  action   : {result.get('action')}")
+                for name, orch in night_accounts.items():
+                    exec_result = orch.run_execution(broker=broker)
+                    logger.info("run_execution[%s] result: %s", name, exec_result)
+                    print(f"\n  [15:05 execution · {name}]")
+                    print(f"  action   : {exec_result.get('action')}")
+                    if "pnl_twd" in exec_result:
+                        print(f"  pnl_twd  : {exec_result['pnl_twd']:.0f} NTD")
+
+            if next_open_accounts:
+                logger.info("── run-once next_open: daily cycle ──")
+                for name, orch in next_open_accounts.items():
+                    result = orch.run_daily(broker=broker)
+                    logger.info("run_daily[%s] result: %s", name, result)
+                    print(f"\n  [{name}] action: {result.get('action')}")
         finally:
             if broker:
                 broker.logout()
@@ -428,16 +409,22 @@ def main(argv=None) -> None:
 
     scheduler = BlockingScheduler(timezone="Asia/Taipei")
 
-    # 14:25 data update (runs before signal, failure non-blocking)
+    # 14:25 data update — iterates every unique product in accounts.yaml.
+    # Per-product failure is isolated (logged + LINE alert) and does not
+    # block the others or the 14:30 signal job.
     def _safe_data_update():
         try:
-            from src.data.daily_updater import update as update_parquet
+            from src.data.daily_updater import update_all
 
-            result = update_parquet(notify_fn=notify_fn)
-            if not result.get("success"):
-                logger.error("14:25 data update failed: %s", result.get("error"))
-            else:
-                logger.info("14:25 data update: %s", result)
+            results = update_all(config_path=args.config, notify_fn=notify_fn)
+            for r in results:
+                if not r.get("success"):
+                    logger.error(
+                        "14:25 data update [%s] failed: %s",
+                        r.get("product"), r.get("error"),
+                    )
+                else:
+                    logger.info("14:25 data update [%s]: %s", r.get("product"), r)
         except Exception as exc:
             logger.error("🔴 資料更新失敗: %s", exc)
             try:
@@ -452,27 +439,40 @@ def main(argv=None) -> None:
         name="V2b 14:25 資料更新",
     )
 
-    # Each job creates a fresh broker to avoid token expiry
-    def _run_signal():
+    # Each job creates a fresh broker to avoid token expiry, then iterates the
+    # accounts whose execution timing matches.
+    def _run_signal_all():
         b = _build_broker(is_live)
         try:
-            orchestrator.run_signal(broker=b)
+            for name, orch in night_accounts.items():
+                try:
+                    orch.run_signal(broker=b)
+                except Exception as exc:
+                    logger.exception("run_signal[%s] failed: %s", name, exc)
         finally:
             if b:
                 b.logout()
 
-    def _run_execution():
+    def _run_execution_all():
         b = _build_broker(is_live)
         try:
-            orchestrator.run_execution(broker=b)
+            for name, orch in night_accounts.items():
+                try:
+                    orch.run_execution(broker=b)
+                except Exception as exc:
+                    logger.exception("run_execution[%s] failed: %s", name, exc)
         finally:
             if b:
                 b.logout()
 
-    def _run_daily():
+    def _run_daily_all():
         b = _build_broker(is_live)
         try:
-            orchestrator.run_daily(broker=b)
+            for name, orch in next_open_accounts.items():
+                try:
+                    orch.run_daily(broker=b)
+                except Exception as exc:
+                    logger.exception("run_daily[%s] failed: %s", name, exc)
         finally:
             if b:
                 b.logout()
@@ -509,18 +509,18 @@ def main(argv=None) -> None:
         name="V2b 14:28 連線預熱",
     )
 
-    if orchestrator.execution_timing == "night_open":
+    if night_accounts:
         scheduler.add_job(
-            func=_run_signal,
+            func=_run_signal_all,
             trigger=CronTrigger(day_of_week="mon-fri", hour=14, minute=30),
             id="v2b_signal",
-            name="V2b 14:30 信號",
+            name=f"V2b 14:30 信號 ×{len(night_accounts)}",
         )
         scheduler.add_job(
-            func=_run_execution,
+            func=_run_execution_all,
             trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=5),
             id="v2b_execution",
-            name="V2b 15:05 夜盤下單",
+            name=f"V2b 15:05 夜盤下單 ×{len(night_accounts)}",
         )
 
         # 15:10 post-execution verification
@@ -540,19 +540,21 @@ def main(argv=None) -> None:
         )
 
         logger.info(
-            "Scheduler registered: 14:25 (data) + 14:28 (warmup) + "
-            "14:30 (signal) + 15:05 (execution) + 15:10 (verify) Asia/Taipei"
+            "Scheduler registered night ×%d: 14:30 signal + 15:05 execution + "
+            "15:10 verify",
+            len(night_accounts),
         )
-    else:
+
+    if next_open_accounts:
         scheduler.add_job(
-            func=_run_daily,
+            func=_run_daily_all,
             trigger=CronTrigger(day_of_week="mon-fri", hour=14, minute=30),
             id="v2b_daily",
-            name="V2b 14:30 每日執行",
+            name=f"V2b 14:30 每日執行 ×{len(next_open_accounts)}",
         )
         logger.info(
-            "Scheduler registered: 14:25 (data) + 14:28 (warmup) + "
-            "14:30 Asia/Taipei"
+            "Scheduler registered next_open ×%d: 14:30 daily",
+            len(next_open_accounts),
         )
 
     # 20:00 pre-settlement check (runs every weekday, skips if not pre-settlement)
@@ -569,6 +571,12 @@ def main(argv=None) -> None:
         trigger=CronTrigger(day_of_week="mon-fri", hour=20, minute=0),
         id="v2b_pre_settlement",
         name="V2b 20:00 結算日前檢查",
+    )
+
+    logger.info(
+        "Scheduler registered: 14:25 (data) + 14:28 (warmup) + night=%d + "
+        "next_open=%d + 20:00 (pre-settlement)",
+        len(night_accounts), len(next_open_accounts),
     )
 
     logger.info("Press Ctrl+C to stop.")

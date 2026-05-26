@@ -1,25 +1,48 @@
 """Parquet 健康檢查。
 
-Usage: python scripts/verify_data.py
+Usage:
+    python scripts/verify_data.py                 # 預設 MXF
+    python scripts/verify_data.py --product MXF
+    python scripts/verify_data.py --product 2330
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
 import pandas as pd
 
-DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "MXF_Daily_Clean_2020_to_now.parquet"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# Per-product config: parquet filename + sane close-price band
+PRODUCT_CONFIG = {
+    "MXF":  {"filename": "MXF_Daily_Clean_2020_to_now.parquet",  "close_range": (5_000, 60_000)},
+    "2330": {"filename": "2330_Daily_Clean_2020_to_now.parquet", "close_range": (200, 3_000)},
+}
 
 
 def main():
-    if not DATA_PATH.exists():
-        print(f"FAIL: {DATA_PATH} not found")
-        print("  Run: python scripts/init_data.py")
+    parser = argparse.ArgumentParser(description="Verify daily K parquet health.")
+    parser.add_argument(
+        "--product",
+        default="MXF",
+        choices=list(PRODUCT_CONFIG.keys()),
+        help="Which parquet to check (default: MXF)",
+    )
+    args = parser.parse_args()
+
+    cfg = PRODUCT_CONFIG[args.product]
+    data_path = DATA_DIR / cfg["filename"]
+    lo, hi = cfg["close_range"]
+
+    if not data_path.exists():
+        print(f"FAIL: {data_path} not found")
+        print(f"  Run: python scripts/init_data.py --product {args.product}")
         sys.exit(1)
 
-    df = pd.read_parquet(DATA_PATH)
+    df = pd.read_parquet(data_path)
     if hasattr(df.index, "tz") and df.index.tz is not None:
         df.index = df.index.tz_localize(None)
     df = df.sort_index()
@@ -63,9 +86,11 @@ def main():
         issues.append(f"DUPLICATE DATES: {len(dups)} duplicates")
 
     # 4. Close range
-    out_of_range = df[(df["close"] < 5_000) | (df["close"] > 60_000)]
+    out_of_range = df[(df["close"] < lo) | (df["close"] > hi)]
     if len(out_of_range) > 0:
-        issues.append(f"OUT OF RANGE: {len(out_of_range)} rows with close outside 10K-50K")
+        issues.append(
+            f"OUT OF RANGE: {len(out_of_range)} rows with close outside {lo:,}-{hi:,}"
+        )
 
     # 5. NaN
     nan_count = df.isna().sum().sum()
@@ -73,7 +98,7 @@ def main():
         issues.append(f"NaN: {nan_count} NaN values")
 
     # Report
-    print(f"Data: {DATA_PATH.name}")
+    print(f"Data: {data_path.name}")
     print(f"  Bars: {len(df)}")
     print(f"  Range: {df.index[0].date()} → {latest}")
     print(f"  Last close: {df['close'].iloc[-1]:,.0f}")

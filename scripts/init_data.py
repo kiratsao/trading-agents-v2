@@ -1,13 +1,18 @@
-"""首次部署或資料損壞時，從 TAIFEX 官網重建完整日K parquet。
+"""首次部署或資料損壞時，重建完整日K parquet。
 
-Usage: python scripts/init_data.py
+Usage:
+    python scripts/init_data.py                  # 預設 MXF (TAIFEX)
+    python scripts/init_data.py --product MXF    # 期貨日K (TAIFEX MTX)
+    python scripts/init_data.py --product 2330   # 台積電現貨日K (yfinance 2330.TW)
 
-資料來源：TAIFEX 期貨每日交易行情下載
-https://www.taifex.com.tw/cht/3/futDataDown
+資料來源：
+    MXF  → TAIFEX 期貨每日交易行情 (https://www.taifex.com.tw/cht/3/futDataDown)
+    2330 → yfinance 2330.TW 現貨日K（僅供信號生成；執行使用 CDF 股票期貨）
 """
 
 from __future__ import annotations
 
+import argparse
 import io
 import sys
 import time as _time
@@ -20,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-OUT_PATH = DATA_DIR / "MXF_Daily_Clean_2020_to_now.parquet"
 
 START_YEAR = 2020
 START_MONTH = 1
@@ -113,7 +117,8 @@ def fetch_taifex_month(year: int, month: int, product: str = "MTX") -> pd.DataFr
     return daily
 
 
-def main():
+def fetch_mxf() -> pd.DataFrame:
+    """Build MXF daily K from TAIFEX MTX month-by-month."""
     today = date.today()
     all_bars = []
 
@@ -150,10 +155,82 @@ def main():
     daily = pd.concat(all_bars).sort_index()
     daily.index = pd.to_datetime(daily.index)
     daily.index.name = "date"
-
-    # Remove weekends + duplicates
     daily = daily[daily.index.dayofweek < 5]
     daily = daily[~daily.index.duplicated(keep="last")]
+    return daily
+
+
+def fetch_2330() -> pd.DataFrame:
+    """Fetch 2330.TW daily OHLCV from yfinance.
+
+    Cash stock (現貨), used for signal generation only — execution uses the
+    CDF stock-futures contract with its own tick value & margin. auto_adjust
+    smooths splits/dividends so EMA/ADX don't see fake gaps on ex-div days.
+    """
+    import yfinance as yf
+
+    start = f"{START_YEAR}-{START_MONTH:02d}-01"
+    today = date.today().isoformat()
+
+    print(f"Fetching 2330.TW daily from yfinance: {start} → {today}")
+    df = yf.download(
+        "2330.TW",
+        start=start,
+        end=today,
+        progress=False,
+        auto_adjust=True,
+    )
+    if df is None or df.empty:
+        print("ERROR: No data fetched from yfinance")
+        sys.exit(1)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    df = df.rename(
+        columns={
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        }
+    )
+    df = df[["open", "high", "low", "close", "volume"]].copy()
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    df.index.name = "date"
+    df = df[df.index.dayofweek < 5]
+    df = df[~df.index.duplicated(keep="last")]
+    print(f"  fetched {len(df)} bars")
+    return df
+
+
+PRODUCT_FETCHERS = {
+    "MXF": (fetch_mxf, "MXF_Daily_Clean_2020_to_now.parquet"),
+    "2330": (fetch_2330, "2330_Daily_Clean_2020_to_now.parquet"),
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Rebuild daily K parquet for a product.")
+    parser.add_argument(
+        "--product",
+        default="MXF",
+        choices=list(PRODUCT_FETCHERS.keys()),
+        help="Which product to fetch (default: MXF)",
+    )
+    parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip the recent-20-day Shioaji cross-validation (MXF only).",
+    )
+    args = parser.parse_args()
+
+    fetcher, filename = PRODUCT_FETCHERS[args.product]
+    daily = fetcher()
+    out_path = DATA_DIR / filename
 
     # Remove TAIFEX holidays (e.g. 5/1 勞動節 — 夜盤 bar 被誤歸該日)
     from src.data.tw_holidays import is_taifex_holiday
@@ -165,12 +242,29 @@ def main():
         print(f"  Removed {n_holidays} holiday bars: {removed_dates[:10]}")
         daily = daily[~holiday_mask]
 
+    # Cross-validate the recent 20 days against Shioaji (B1). TAIFEX is the
+    # build source; Shioaji is the independent oracle — divergence > 50pt is
+    # overridden with the Shioaji value. MXF only (Shioaji has no 2330 daily).
+    if args.product == "MXF" and not args.no_validate:
+        try:
+            from src.data.validation import validate_and_override_with_shioaji
+
+            daily, overridden = validate_and_override_with_shioaji(
+                daily, recent_days=20, log=print,
+            )
+            if overridden:
+                print(f"  Cross-validation: overrode {len(overridden)} bar(s) with Shioaji")
+            else:
+                print("  Cross-validation: recent 20 days agree with Shioaji (差 ≤ 50pt)")
+        except Exception as exc:
+            print(f"  Cross-validation skipped (Shioaji unavailable): {exc}")
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    daily.to_parquet(OUT_PATH, index=True)
-    print(f"\nSaved: {OUT_PATH}")
+    daily.to_parquet(out_path, index=True)
+    print(f"\nSaved: {out_path}")
     print(f"  Bars: {len(daily)}")
     print(f"  Range: {daily.index[0].date()} → {daily.index[-1].date()}")
-    print(f"  Last close: {daily['close'].iloc[-1]:,.0f}")
+    print(f"  Last close: {daily['close'].iloc[-1]:,.2f}")
 
 
 if __name__ == "__main__":

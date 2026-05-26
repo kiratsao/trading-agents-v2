@@ -1,58 +1,65 @@
-# V2b Paper Trading 帳戶設定
+# V2b Paper Trading 帳戶設定 — 多市場
 #
-# 帳戶名稱: aggressive
-# 策略: V2b EMA(30/100) CD2 ATR×2.0 ADX>25
-# 商品: MXF (小台指)
-# 初始資金: 880,000 NTD
+# mxf_aggressive: MXF (小台指) — V2b CD2 ADX>25
+# tsmc_2330:      2330 股票期貨 (CDF) — V2b CD2 ADX>30, 不強制結算平倉
 
 accounts:
-  aggressive:
+  mxf_aggressive:
+    product: MXF
     equity: 880000
-    contracts: 6
-
     strategy_params:
       ema_fast: 30
       ema_slow: 100
       atr_stop_mult: 2.0
       confirm_days: 2
       adx_threshold: 25
-
     scale_ladder:
-      - equity: 350000
-        contracts: 2
-      - equity: 480000
-        contracts: 3
-      - equity: 600000
-        contracts: 4
-      - equity: 720000
-        contracts: 5
-      - equity: 840000
-        contracts: 6
-      - equity: 960000
-        contracts: 7
-      - equity: 1080000
-        contracts: 8
-      - equity: 1200000
-        contracts: 9
-      - equity: 1320000
-        contracts: 10
-      - equity: 1440000
-        contracts: 11
-      - equity: 1560000
-        contracts: 12
-      - equity: 1680000
-        contracts: 13
-      - equity: 1800000
-        contracts: 14
-      - equity: 1920000
-        contracts: 15
-
+      - {equity:  350000, contracts: 2}
+      - {equity:  480000, contracts: 3}
+      - {equity:  600000, contracts: 4}
+      - {equity:  720000, contracts: 5}
+      - {equity:  840000, contracts: 6}
+      - {equity:  960000, contracts: 7}
+      - {equity: 1080000, contracts: 8}
+      - {equity: 1200000, contracts: 9}
+      - {equity: 1320000, contracts: 10}
+      - {equity: 1440000, contracts: 11}
+      - {equity: 1560000, contracts: 12}
+      - {equity: 1680000, contracts: 13}
+      - {equity: 1800000, contracts: 14}
+      - {equity: 1920000, contracts: 15}
     margin_per_contract: 131500   # TAIFEX 2026-04-27 調整
     max_contracts: 15
-
+    settlement_force_close: true
     sessions:
       day:
         execution_timing: "night_open"
         decision_time: "14:30"
         execution_time: "15:05"
-        enable_tsmc_signal: false
+
+  tsmc_2330:
+    product: "2330"
+    equity: 800000
+    strategy_params:
+      ema_fast: 30
+      ema_slow: 100
+      atr_stop_mult: 2.0
+      confirm_days: 2
+      adx_threshold: 30
+    scale_ladder:
+      # 430K margin/contract → step roughly every 500-700K of equity.
+      # Margin safety cap in V2bEngine is the hard floor; this ladder is the
+      # softer scale-out target. max_contracts is the absolute ceiling.
+      - {equity:  800000, contracts: 1}
+      - {equity: 1200000, contracts: 2}
+      - {equity: 1800000, contracts: 3}
+      - {equity: 2500000, contracts: 4}
+      - {equity: 3200000, contracts: 5}
+    margin_per_contract: 430000
+    max_contracts: 5
+    settlement_force_close: false
+    sessions:
+      day:
+        execution_timing: "night_open"
+        decision_time: "14:30"
+        execution_time: "15:05"

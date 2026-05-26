@@ -47,6 +47,7 @@ _GAP_SCAN_LOOKBACK_DAYS = 10
 def update(
     parquet_path: Path | None = None,
     notify_fn: Callable[[str], Any] | None = None,
+    validate_fn: Callable[[date, float], tuple[str, list]] | None = None,
 ) -> dict:
     """Fetch new daily bars from Shioaji and append to parquet.
 
@@ -172,6 +173,34 @@ def update(
             "latest_date": str(last_date),
             "error": None,
         }
+
+    # 5b. Cross-source validation of the newest bar BEFORE persisting (B2).
+    #     >ALERT-pt divergence vs an independent oracle → refuse to write so a
+    #     bad bar never contaminates the parquet (the off-by-1,300pt class).
+    if validate_fn is not None:
+        _vday = new_bars.index[-1].date()
+        _vclose = float(new_bars["close"].iloc[-1])
+        level, vdiffs = validate_fn(_vday, _vclose)
+        if level == "alert":
+            detail = "; ".join(str(cd) for cd in vdiffs)
+            msg = (
+                f"🔴 資料驗證失敗: {_vday} close={_vclose:,.0f} 與獨立來源差異過大，"
+                f"不存入 parquet ({detail})"
+            )
+            logger.error(msg)
+            _notify(msg)
+            return {
+                "success": False,
+                "bars_added": 0,
+                "gaps_filled": 0,
+                "latest_date": str(last_date),
+                "error": msg,
+            }
+        if level == "warn":
+            detail = "; ".join(str(cd) for cd in vdiffs)
+            wmsg = f"⚠️ 資料驗證: {_vday} close 與來源差異 ({detail})，仍寫入 parquet"
+            logger.warning(wmsg)
+            _notify(wmsg)
 
     # 6. Append and save
     df = pd.concat([df, new_bars]).sort_index()
@@ -420,6 +449,76 @@ def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
         )
         daily = daily[~bad]
     return daily
+
+
+def update_all(
+    config_path: str = "config/accounts.yaml",
+    notify_fn: Callable[[str], Any] | None = None,
+    *,
+    enable_validation: bool = True,
+) -> list[dict]:
+    """Update the parquet for every unique product in *config_path*.
+
+    MXF index futures update from Shioaji 1-min kbars (with B2 cross-source
+    validation against an independent oracle). Products without a Shioaji
+    daily updater — e.g. ``2330`` (sourced from yfinance via ``init_data`` for
+    signal generation only) — are skipped with an informational result rather
+    than failing. Per-product failures are isolated so one product can't block
+    another or the 14:30 signal job.
+
+    Returns a list of per-product result dicts (each carries ``product``).
+    """
+    import yaml
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.error("update_all: cannot read %s: %s", config_path, exc)
+        return [{
+            "product": None, "success": False, "bars_added": 0,
+            "gaps_filled": 0, "latest_date": None,
+            "error": f"config read failed: {exc}",
+        }]
+
+    products: list[str] = []
+    for acc in cfg.get("accounts", {}).values():
+        p = acc.get("product", "MXF")
+        if p not in products:
+            products.append(p)
+
+    results: list[dict] = []
+    for product in products:
+        if product == "MXF":
+            validate_fn = None
+            if enable_validation:
+                from src.data.validation import validate_latest_bar
+                validate_fn = validate_latest_bar
+            try:
+                r = update(
+                    parquet_path=_DATA_DIR / f"{product}_Daily_Clean_2020_to_now.parquet",
+                    notify_fn=notify_fn,
+                    validate_fn=validate_fn,
+                )
+            except Exception as exc:
+                logger.exception("update_all: %s update raised: %s", product, exc)
+                r = {
+                    "success": False, "bars_added": 0, "gaps_filled": 0,
+                    "latest_date": None, "error": f"{product} update raised: {exc}",
+                }
+        else:
+            logger.info(
+                "update_all: %s has no Shioaji daily updater — skipped "
+                "(signal data via init_data/yfinance)", product,
+            )
+            r = {
+                "success": True, "bars_added": 0, "gaps_filled": 0,
+                "skipped": True, "latest_date": None, "error": None,
+                "note": f"{product}: no Shioaji updater (yfinance/init_data only)",
+            }
+        r["product"] = product
+        results.append(r)
+    return results
 
 
 def _today_taipei() -> date:
