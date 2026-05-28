@@ -51,15 +51,27 @@ def test_validate_latest_bar_warns_between_50_and_200():
     assert [cd.source for cd in diffs] == ["taifex"]
 
 
-def test_validate_latest_bar_alerts_above_200():
+def test_validate_latest_bar_alerts_above_500():
     d = date(2026, 5, 21)
     level, diffs = validate_latest_bar(
         d, 20_000.0,
-        shioaji_fetch=lambda a, b: _ref(d, 20_350.0),  # 350pt → alert
+        shioaji_fetch=lambda a, b: _ref(d, 20_600.0),  # 600pt > max(500, 1.5%=300) → alert
         taifex_fetch=lambda a, b: _ref(d, 20_000.0),
     )
     assert level == "alert"
-    assert any(cd.diff > 200 for cd in diffs)
+    assert any(cd.diff > 500 for cd in diffs)
+
+
+def test_validate_latest_bar_warns_not_alerts_on_settlement_gap():
+    # 5/26 regression: high-vol ref but 491pt day-close vs settlement gap →
+    # warn (still written), NOT alert. close=44,386 vs 43,895 (vol=131,486).
+    d = date(2026, 5, 26)
+    level, _ = validate_latest_bar(
+        d, 44_386.0,
+        shioaji_fetch=lambda a, b: _ref(d, 44_386.0, volume=131_486),  # agrees
+        taifex_fetch=lambda a, b: _ref(d, 43_895.0, volume=131_486),   # 491pt, reliable
+    )
+    assert level == "warn"          # 491 < max(500, 1.5%*44386≈666) → not blocked
 
 
 def test_validate_latest_bar_skips_low_volume_ref():

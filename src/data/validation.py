@@ -25,8 +25,11 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 WARN_THRESHOLD = 50.0    # points — surface a ⚠️ but keep the bar
-ALERT_THRESHOLD = 200.0  # points — 🔴 and refuse to persist
-ALERT_PCT = 0.01         # ...or 1% of close, whichever is larger (settle-noise tolerant)
+# Day-session kbar close (13:44 last tick) vs TAIFEX settlement price (incl.
+# post-close matching) differ structurally by 300-500pt on volatile days
+# (ATR>800), so block only on a genuinely large divergence.
+ALERT_THRESHOLD = 500.0  # points — 🔴 and refuse to persist
+ALERT_PCT = 0.015        # ...or 1.5% of close, whichever is larger
 # An oracle ref below this volume is unreliable — MXFR1 historical queries
 # return rolling-contract data with vol≈0, which must NOT block a real update.
 _REF_VOLUME_FLOOR = 1_000
@@ -132,8 +135,8 @@ def validate_latest_bar(
         if d > warn:
             diffs.append(CloseDiff(day, float(close), ref_close, d, source, ref_vol))
 
-    # Block only on a LARGE divergence from a reliable oracle: max(200pt, 1% of
-    # close) tolerates the benign settlement-price vs last-trade gap.
+    # Block only on a LARGE divergence from a reliable oracle: max(500pt, 1.5%
+    # of close) tolerates the structural day-close vs settlement-price gap.
     alert_pts = max(alert, ALERT_PCT * float(close))
     level = "ok"
     if any(cd.diff > alert_pts for cd in diffs):
