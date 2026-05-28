@@ -214,8 +214,12 @@ def test_round2_skips_when_fetch_dead(tmp_path):
 
 # ── run_deep_health_check: light mode + iteration convergence ────────────────
 def test_run_light_converges_after_autofix(tmp_path):
+    from src.utils.freshness import expected_parquet_latest
+
     parquet = tmp_path / "MXF.parquet"
-    write_synthetic_parquet(parquet, n_bars=120)
+    # End the parquet at the expected latest so the new freshness gate is ✅
+    # (this test targets Round-3 auto-fix convergence, not freshness).
+    write_synthetic_parquet(parquet, n_bars=120, end=expected_parquet_latest())
     cfg = {"accounts": {"mxf_aggressive": {"product": "MXF"}}}
     cfg_path = tmp_path / "accounts.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")

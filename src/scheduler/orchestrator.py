@@ -297,15 +297,27 @@ class V2bOrchestrator:
             logger.error("No market data available.")
             return {"action": "error", "reason": "no data"}
 
-        # Data freshness guard: parquet must have at least yesterday's bar
-        freshness = self._check_data_freshness(df)
-        if freshness is not None:
-            self.notify_fn(freshness)
-            logger.warning("Data freshness check: %s", freshness)
+        # Data freshness guard — delegates to the single source of truth.
+        is_fresh, fresh_msg = self._check_data_freshness()
+        if not is_fresh:
+            self.notify_fn(fresh_msg)
+            logger.warning("Data freshness check: %s", fresh_msg)
 
         state = self.state_mgr.load()
         # Cache the latest live equity into state when broker can serve it.
         equity, equity_src = _persist_live_equity(broker, state, self.state_mgr)
+
+        # Advance the trailing high-water mark from today's close BEFORE the
+        # signal is computed. Backtest trails on close (backtest/engine.py:258);
+        # in night_open mode this used to never persist (run_signal didn't touch
+        # it; run_execution only did when exec_price was passed, which prod does
+        # not), so highest_high froze for the whole hold and the trailing stop
+        # never ratcheted up. Persist it here every trading day.
+        if state.position > 0:
+            today_close = float(df["close"].iloc[-1])
+            if state.highest_high is None or today_close > state.highest_high:
+                state.highest_high = today_close
+
         display_ind = self._compute_display_indicators(df, state)
 
         sig = self.strategy.generate_signal(
@@ -612,28 +624,16 @@ class V2bOrchestrator:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _check_data_freshness(self, df: pd.DataFrame) -> str | None:
-        """Check that parquet data is reasonably fresh.
+    def _check_data_freshness(self) -> tuple[bool, str]:
+        """Delegate to the single source of truth (src.utils.freshness).
 
-        Returns a warning string if data is stale, None if OK.
-        Stale = latest bar date < 2 trading days ago (allows for holidays).
+        Checks the persisted parquet on disk (not the in-memory df, which has
+        today's snapshot bar appended). Returns ``(is_fresh, msg)``.
         """
-        if df is None or df.empty:
-            return "🔴 資料防護: parquet 為空"
-        latest = df.index[-1].date()
-        today = pd.Timestamp.now(tz="Asia/Taipei").date()
-        # Trading days strictly between latest and today, per the TAIFEX
-        # calendar (excludes weekends AND holidays — pd.bdate_range counted
-        # holidays as trading days and over-reported staleness).
-        from src.data.tw_holidays import trading_days_between
+        from src.utils.freshness import check_parquet_freshness
 
-        gap = sum(1 for d in trading_days_between(latest, today) if latest < d < today)
-        if gap > 2:
-            return (
-                f"⚠️ 資料可能過期: parquet 最新={latest}, "
-                f"今天={today}, 差 {gap} 個交易日"
-            )
-        return None
+        is_fresh, msg, _ = check_parquet_freshness(self.data_path)
+        return is_fresh, msg
 
     def _compute_display_indicators(
         self,

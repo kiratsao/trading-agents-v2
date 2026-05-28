@@ -8,7 +8,7 @@ orchestrator's state/order/notification behaviour deterministically.
 """
 
 import sys
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +16,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.daily_health_check import check_freshness
 from src.data import daily_updater
 from src.scheduler.orchestrator import V2bOrchestrator
 from src.state.state_manager import StateManager
@@ -57,7 +56,7 @@ def _seed(sm, **kw):
 
 # ── Case 1: normal trading day, HOLD ────────────────────────────────────────
 def test_case1_normal_day_hold(tmp_path):
-    orch, sm, msgs, _ = _make(tmp_path, [Signal("hold", 0, "金叉+ADX>25+close>stop")])
+    orch, sm, msgs, parquet = _make(tmp_path, [Signal("hold", 0, "金叉+ADX>25+close>stop")])
     _seed(sm, position=8, entry_price=20_000.0, contracts=8, highest_high=20_100.0)
     fb = FakeBroker(equity=2_000_000.0)
     fb.seed_position(8, 20_000.0)
@@ -70,7 +69,9 @@ def test_case1_normal_day_hold(tmp_path):
     assert fb.orders == []                       # 15:05 無動作
     st = sm.load()
     assert st.position == 8                       # 口數一致 (post_verify)
-    assert st.highest_high == 20_200.0            # trailing high advanced
+    # run_signal advanced highest_high to today's (parquet) close — Task B fix.
+    last_close = float(pd.read_parquet(parquet)["close"].iloc[-1])
+    assert st.highest_high == last_close and st.highest_high > 20_100.0
     assert any("HOLD" in m for m in msgs)
 
 
@@ -223,29 +224,46 @@ def test_case7_data_gap_backfill(tmp_path):
     assert any("⚠️" in m and "需手動處理" in m for m in msgs2)
 
 
-# ── _check_data_freshness: trading-day aware (not pd.bdate_range) ───────────
-def test_check_data_freshness_counts_trading_days(tmp_path):
-    from src.data.tw_holidays import last_trading_day_before
+# ── _check_data_freshness now delegates to src.utils.freshness ──────────────
+def test_check_data_freshness_delegates(tmp_path):
+    from src.utils.freshness import expected_parquet_latest
 
-    orch, _, _, _ = _make(tmp_path, [Signal("hold", 0, "x")])
-    today = pd.Timestamp.now(tz="Asia/Taipei").date()
+    orch, _, _, parquet = _make(tmp_path, [Signal("hold", 0, "x")])
 
-    def df_latest(d):
-        return pd.DataFrame({"close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp(d)]))
+    def _write(latest):
+        pd.DataFrame(
+            {"open": [1], "high": [1], "low": [1], "close": [1.0], "volume": [99999]},
+            index=pd.DatetimeIndex([pd.Timestamp(latest)], name="date"),
+        ).to_parquet(parquet, index=True)
 
-    d1 = last_trading_day_before(today)               # 1 trading day back → fresh
-    assert orch._check_data_freshness(df_latest(d1)) is None
+    _write(expected_parquet_latest())          # parquet at expected → fresh
+    assert orch._check_data_freshness()[0] is True
 
-    d4 = d1
-    for _ in range(3):
-        d4 = last_trading_day_before(d4)              # 4 back → 3 trading days gap
-    msg = orch._check_data_freshness(df_latest(d4))
-    assert msg is not None and "過期" in msg
+    _write("2020-01-02")                        # ancient → stale
+    is_fresh, msg = orch._check_data_freshness()
+    assert is_fresh is False and "過期" in msg
 
 
-# ── Case 8: Monday-morning health check, no false alarm ─────────────────────
-def test_case8_monday_morning_no_false_alarm(tmp_path):
-    # 週一 08:00, latest = 上週四 → ✅ (pre-14:25 slack)
-    assert check_freshness(datetime(2026, 5, 25, 8, 0), date(2026, 5, 21))[0] == "ok"
-    # 週一 08:00, 上週五放假, latest = 上週四 → ✅
-    assert check_freshness(datetime(2026, 5, 4, 8, 0), date(2026, 4, 30))[0] == "ok"
+# ── Task B: highest_high advances on a new daily close (trailing not frozen) ─
+def test_highest_high_updates_on_new_high(tmp_path):
+    orch, sm, _, parquet = _make(
+        tmp_path, [Signal("hold", 0, "h"), Signal("hold", 0, "h"), Signal("hold", 0, "h")])
+    _seed(sm, position=5, entry_price=20_000.0, contracts=5, highest_high=20_100.0)
+    fb = FakeBroker(equity=2_000_000.0)
+    fb.seed_position(5, 20_000.0)
+
+    def set_close(c):
+        pd.DataFrame(
+            {"open": [c], "high": [c], "low": [c], "close": [float(c)], "volume": [99999]},
+            index=pd.DatetimeIndex([pd.Timestamp("2026-05-21")], name="date"),
+        ).to_parquet(parquet, index=True)
+
+    set_close(20_500)
+    orch.run_signal(broker=fb)
+    assert sm.load().highest_high == 20_500.0          # advanced from 20100
+    set_close(21_000)
+    orch.run_signal(broker=fb)
+    assert sm.load().highest_high == 21_000.0          # advances again
+    set_close(20_800)
+    orch.run_signal(broker=fb)
+    assert sm.load().highest_high == 21_000.0          # pullback → monotonic, no drop

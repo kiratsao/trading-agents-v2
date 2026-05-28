@@ -428,5 +428,140 @@ def update_all(
     return results
 
 
+MAX_BACKFILL_DAYS = 10
+_RETRY_BACKOFFS = (30, 60, 120)
+
+
+def ensure_parquet_fresh(
+    parquet_path: Path | None = None,
+    notify_fn: Callable[[str], Any] | None = None,
+    validate_fn: Callable[[date, float], tuple[str, list]] | None = None,
+    *,
+    now=None,
+    fetch_override: Callable[[date, date], pd.DataFrame | None] | None = None,
+    sleep=None,
+) -> dict:
+    """Declarative canonical updater: ensure the parquet reaches
+    ``expected_parquet_latest(now)``.
+
+    Gap-based backfill (≤ MAX_BACKFILL_DAYS) with per-day retry + backoff
+    (30/60/120s), atomic write (tmp + os.replace), and a post-write re-read
+    verification. NEVER calls sys.exit — raises ``DataIntegrityError`` or
+    returns ``{status, latest, target, filled, missing}`` where status is one
+    of ``noop`` / ``ok`` / ``partial``.
+    """
+    import time as _time
+
+    from src.utils.freshness import (
+        DataIntegrityError,
+        expected_parquet_latest,
+        trading_days_between,
+    )
+
+    parquet_path = Path(parquet_path or _PRIMARY_PARQUET)
+    _notify = notify_fn or (lambda msg: None)
+    fetch = fetch_override or _fetch_and_aggregate
+    _sleep = sleep or _time.sleep
+
+    target = expected_parquet_latest(now)
+    df = _read_parquet_safe(parquet_path)
+    if len(df) == 0:
+        raise DataIntegrityError(
+            f"parquet missing/empty: {parquet_path} — run scripts/init_data.py"
+        )
+
+    last = pd.DatetimeIndex(df.index).max().date()
+    missing = trading_days_between(last, target)
+    if not missing:
+        return {"status": "noop", "latest": str(last), "target": str(target),
+                "filled": 0, "missing": []}
+    if len(missing) > MAX_BACKFILL_DAYS:
+        raise DataIntegrityError(
+            f"gap {len(missing)} trading days > MAX_BACKFILL_DAYS={MAX_BACKFILL_DAYS} "
+            f"(last={last}, target={target}) — run scripts/init_data.py"
+        )
+
+    still_missing: list[date] = []
+    filled = 0
+    for d in missing:
+        bar = _fetch_day_with_retry(fetch, d, _sleep)
+        if bar is None or bar.empty:
+            still_missing.append(d)
+            _notify(f"⚠️ {d.isoformat()} 補資料失敗 (retry 3x)")
+            continue
+        bar = bar[bar.index.dayofweek < 5]
+        bar = bar[~bar.index.normalize().isin(pd.DatetimeIndex(df.index).normalize())]
+        if bar.empty:
+            continue
+        if validate_fn is not None:
+            vclose = float(bar["close"].iloc[-1])
+            level, vdiffs = validate_fn(d, vclose)
+            if level == "alert":
+                detail = "; ".join(str(cd) for cd in vdiffs)
+                msg = f"🔴 資料驗證失敗 {d}: close={vclose:,.0f} ({detail}) — 不寫入"
+                logger.error(msg)
+                _notify(msg)
+                still_missing.append(d)
+                continue
+            if level == "warn":
+                _notify(f"⚠️ 資料驗證 {d}: {'; '.join(str(cd) for cd in vdiffs)}，仍寫入")
+        df = pd.concat([df, bar]).sort_index()
+        df.index = pd.to_datetime(df.index)
+        df.index.name = "date"
+        _atomic_write_parquet(df, parquet_path)
+        filled += 1
+        _notify(f"✅ {d.isoformat()} 補資料成功")
+
+    # Post-write verification — re-read from disk, confirm we reached target.
+    verify = _read_parquet_safe(parquet_path)
+    vlatest = pd.DatetimeIndex(verify.index).max().date() if len(verify) else None
+    if still_missing:
+        return {"status": "partial", "latest": str(vlatest), "target": str(target),
+                "filled": filled, "missing": [d.isoformat() for d in still_missing]}
+    if vlatest is None or vlatest < target:
+        raise DataIntegrityError(
+            f"post-write verification failed: latest={vlatest} < target={target}"
+        )
+    return {"status": "ok", "latest": str(vlatest), "target": str(target),
+            "filled": filled, "missing": []}
+
+
+def _read_parquet_safe(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume"],
+            index=pd.DatetimeIndex([], name="date"),
+        )
+    df = pd.read_parquet(path)
+    df.index = pd.to_datetime(df.index)
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    return df.sort_index()
+
+
+def _atomic_write_parquet(df: pd.DataFrame, path: Path) -> None:
+    import os
+
+    tmp = path.with_suffix(".parquet.tmp")
+    df.to_parquet(tmp, index=True)
+    os.replace(tmp, path)
+
+
+def _fetch_day_with_retry(fetch, d: date, sleep, max_attempts: int = 3) -> pd.DataFrame | None:
+    for attempt in range(max_attempts):
+        try:
+            bar = fetch(d, d)
+            if bar is not None and not bar.empty:
+                return bar
+        except Exception as exc:
+            logger.warning(
+                "ensure_parquet_fresh: fetch %s attempt %d/%d failed: %s",
+                d, attempt + 1, max_attempts, exc,
+            )
+        if attempt < max_attempts - 1:
+            sleep(_RETRY_BACKOFFS[min(attempt, len(_RETRY_BACKOFFS) - 1)])
+    return None
+
+
 def _today_taipei() -> date:
     return pd.Timestamp.now(tz="Asia/Taipei").date()

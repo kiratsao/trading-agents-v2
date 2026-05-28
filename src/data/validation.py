@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 WARN_THRESHOLD = 50.0    # points — surface a ⚠️ but keep the bar
 ALERT_THRESHOLD = 200.0  # points — 🔴 and refuse to persist
+ALERT_PCT = 0.01         # ...or 1% of close, whichever is larger (settle-noise tolerant)
+# An oracle ref below this volume is unreliable — MXFR1 historical queries
+# return rolling-contract data with vol≈0, which must NOT block a real update.
+_REF_VOLUME_FLOOR = 1_000
 
 # A reference fetcher takes (start, end) inclusive dates and returns a daily
 # OHLCV DataFrame (DatetimeIndex) or None when unavailable.
@@ -114,13 +118,25 @@ def validate_latest_bar(
         ts = pd.Timestamp(day)
         if ts not in ref.index or "close" not in ref.columns:
             continue
+        ref_vol = float(ref.loc[ts, "volume"]) if "volume" in ref.columns else 0.0
+        if ref_vol < _REF_VOLUME_FLOOR:
+            # Unreliable oracle (vol≈0 = rolling-contract / empty fetch) — cannot
+            # validate against it; skip rather than block a legitimate update.
+            logger.warning(
+                "validate_latest_bar: %s ref for %s vol=%.0f < %d — skipped (unreliable)",
+                source, day, ref_vol, _REF_VOLUME_FLOOR,
+            )
+            continue
         ref_close = float(ref.loc[ts, "close"])
         d = abs(float(close) - ref_close)
         if d > warn:
-            diffs.append(CloseDiff(day, float(close), ref_close, d, source))
+            diffs.append(CloseDiff(day, float(close), ref_close, d, source, ref_vol))
 
+    # Block only on a LARGE divergence from a reliable oracle: max(200pt, 1% of
+    # close) tolerates the benign settlement-price vs last-trade gap.
+    alert_pts = max(alert, ALERT_PCT * float(close))
     level = "ok"
-    if any(cd.diff > alert for cd in diffs):
+    if any(cd.diff > alert_pts for cd in diffs):
         level = "alert"
     elif diffs:
         level = "warn"

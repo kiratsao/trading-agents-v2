@@ -108,29 +108,29 @@ accounts:
         decision_time: "14:30"
         execution_time: "15:05"
 
-  tsmc_2330:
-    product: "2330"
-    equity: 800000
-    strategy_params:
-      ema_fast: 30
-      ema_slow: 100
-      atr_stop_mult: 2.0
-      confirm_days: 2
-      adx_threshold: 30
-    scale_ladder:
-      # 430K margin/contract → step roughly every 500-700K of equity.
-      # Margin safety cap in V2bEngine is the hard floor; this ladder is the
-      # softer scale-out target. max_contracts is the absolute ceiling.
-      - {equity:  800000, contracts: 1}
-      - {equity: 1200000, contracts: 2}
-      - {equity: 1800000, contracts: 3}
-      - {equity: 2500000, contracts: 4}
-      - {equity: 3200000, contracts: 5}
-    margin_per_contract: 430000
-    max_contracts: 5
-    settlement_force_close: false
-    sessions:
-      day:
-        execution_timing: "night_open"
-        decision_time: "14:30"
-        execution_time: "15:05"
+# tsmc_2330 disabled: V2bEngine's Shioaji day-session fetch path is MXF-only
+# (update_all skips non-MXF; no 2330 daily updater). Re-enable once 2330 data
+# + execution are supported.
+#  tsmc_2330:
+#    product: "2330"
+#    equity: 800000
+#    strategy_params:
+#      ema_fast: 30
+#      ema_slow: 100
+#      atr_stop_mult: 2.0
+#      confirm_days: 2
+#      adx_threshold: 30
+#    scale_ladder:
+#      - {equity:  800000, contracts: 1}
+#      - {equity: 1200000, contracts: 2}
+#      - {equity: 1800000, contracts: 3}
+#      - {equity: 2500000, contracts: 4}
+#      - {equity: 3200000, contracts: 5}
+#    margin_per_contract: 430000
+#    max_contracts: 5
+#    settlement_force_close: false
+#    sessions:
+#      day:
+#        execution_timing: "night_open"
+#        decision_time: "14:30"
+#        execution_time: "15:05"

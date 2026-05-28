@@ -12,15 +12,13 @@ import json
 import logging
 import os
 import sys
-from datetime import date, datetime
-from datetime import time as dtime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 
-from src.data.tw_holidays import last_trading_day_before, trading_days_between
+from src.utils.freshness import check_parquet_freshness
 
 try:
     from dotenv import load_dotenv
@@ -35,40 +33,7 @@ logger = logging.getLogger(__name__)
 _DATA = Path("data/MXF_Daily_Clean_2020_to_now.parquet")
 _STATE = Path("data/paper_state.json")
 
-# daily_updater pulls the current session's bar at 14:25 Taipei.
-_UPDATE_CUTOFF = dtime(14, 25)
-
-
-def _expected_latest(now: datetime) -> date:
-    """The most recent trading-day bar the parquet should already contain.
-
-    Before 14:25 today's bar hasn't been pulled yet, and we allow one extra
-    trading day of slack for the updater → expect the 2nd-to-last trading day.
-    At/after 14:25 → expect the previous trading day.
-    """
-    prev = last_trading_day_before(now.date())
-    if now.time() < _UPDATE_CUTOFF:
-        return last_trading_day_before(prev)
-    return prev
-
-
-def check_freshness(now: datetime, latest: date) -> tuple[str, str]:
-    """Classify parquet freshness in TRADING days (weekends + TAIFEX holidays
-    excluded), not calendar days.
-
-    Returns ``(level, detail)`` where level is one of:
-      ``"ok"``    — latest >= expected            (✅)
-      ``"warn"``  — 1–2 trading days behind        (⚠️)
-      ``"alert"`` — > 2 trading days behind         (🔴)
-    """
-    expected = _expected_latest(now)
-    if latest >= expected:
-        return "ok", f"latest={latest}, expected≥{expected}"
-    behind = sum(1 for d in trading_days_between(latest, expected) if d > latest)
-    detail = f"latest={latest}, expected≥{expected}, 落後 {behind} 交易日"
-    if behind > 2:
-        return "alert", f"Parquet 過期: {detail}"
-    return "warn", f"Parquet 稍舊: {detail}"
+# Parquet freshness now lives in src.utils.freshness (single source of truth).
 
 
 def _send_line(msg: str) -> None:
@@ -154,23 +119,13 @@ def main():
     if refresh_summary:
         logger.info(refresh_summary)
 
-    # 1. Parquet freshness — measured in TRADING days (weekends + TAIFEX
-    #    holidays excluded). Before 14:25 today's bar isn't pulled yet, so we
-    #    expect the 2nd-to-last trading day; calendar-day math used to fire a
-    #    false 🔴 every Monday/post-holiday morning.
-    if _DATA.exists():
-        df = pd.read_parquet(_DATA)
-        df.index = pd.to_datetime(df.index)
-        latest = df.index[-1].date()
-        now = pd.Timestamp.now(tz="Asia/Taipei")
-        level, detail = check_freshness(now, latest)
-        if level == "alert":
-            issues.append(detail)
-        elif level == "warn":
-            warns.append(detail)
-        logger.info("Parquet: %d bars, %s [%s]", len(df), detail, level)
-    else:
-        issues.append(f"Parquet 不存在: {_DATA}")
+    # 1. Parquet freshness — single source of truth (src.utils.freshness).
+    #    2-tier: fresh (✅) or stale (🔴 → exit 1). Time-of-day aware so the
+    #    08:00 run no longer false-alarms before the 14:30 update window.
+    is_fresh, fresh_msg, _expected = check_parquet_freshness(_DATA)
+    if not is_fresh:
+        issues.append(fresh_msg)
+    logger.info("Parquet freshness: %s", fresh_msg)
 
     # 2. State sanity
     if _STATE.exists():

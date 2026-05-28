@@ -422,6 +422,11 @@ def _run_rounds(
     df = pd.read_parquet(parquet_path) if Path(parquet_path).exists() else None
     if df is not None:
         df.index = pd.to_datetime(df.index)
+    # First gate: freshness via the single source of truth.
+    from src.utils.freshness import check_parquet_freshness
+
+    is_fresh, fmsg, _exp = check_parquet_freshness(parquet_path)
+    checks.append(Check(1, "freshness", "ok" if is_fresh else "alert", fmsg))
     checks += round1_data_integrity(df)
 
     if not light:

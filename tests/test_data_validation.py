@@ -20,9 +20,11 @@ from src.data.validation import (
 )
 
 
-def _ref(day: date, close: float) -> pd.DataFrame:
+def _ref(day: date, close: float, volume: float = 90_000) -> pd.DataFrame:
+    # volume defaults well above the reliability floor so the oracle counts;
+    # pass a low volume to exercise the unreliable-ref skip path.
     return pd.DataFrame(
-        [{"open": close, "high": close + 5, "low": close - 5, "close": close, "volume": 1}],
+        [{"open": close, "high": close + 5, "low": close - 5, "close": close, "volume": volume}],
         index=pd.DatetimeIndex([pd.Timestamp(day)], name="date"),
     )
 
@@ -58,6 +60,18 @@ def test_validate_latest_bar_alerts_above_200():
     )
     assert level == "alert"
     assert any(cd.diff > 200 for cd in diffs)
+
+
+def test_validate_latest_bar_skips_low_volume_ref():
+    # The 5/27 regression: a ref with vol≈0 (rolling-contract / empty oracle)
+    # must NOT block a legit update, even with a large close diff.
+    d = date(2026, 5, 27)
+    level, diffs = validate_latest_bar(
+        d, 44_448.0,
+        shioaji_fetch=lambda a, b: _ref(d, 44_448.0, volume=99_000),  # agrees, reliable
+        taifex_fetch=lambda a, b: _ref(d, 44_794.0, volume=0),        # vol=0 → skipped
+    )
+    assert level == "ok" and diffs == []
 
 
 def test_validate_latest_bar_skips_failed_reference():
