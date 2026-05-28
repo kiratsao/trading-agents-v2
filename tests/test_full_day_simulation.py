@@ -244,6 +244,19 @@ def test_check_data_freshness_delegates(tmp_path):
     assert is_fresh is False and "過期" in msg
 
 
+# ── ADD notification shows post-add total ("加碼至 N口"), not current ────────
+def test_add_notification_shows_post_add_total(tmp_path):
+    orch, sm, msgs, _ = _make(tmp_path, [Signal("add", 9, "pyramid")])
+    _seed(sm, position=20, entry_price=20_000.0, contracts=20, highest_high=20_100.0)
+    fb = FakeBroker(equity=5_000_000.0)
+    fb.seed_position(20, 20_000.0)
+
+    orch.run_signal(broker=fb)
+    joined = " ".join(msgs)
+    assert "加碼至 29口" in joined          # 20 + 9, not the pre-add 20
+    assert "加碼至 20口" not in joined
+
+
 # ── Task B: highest_high advances on a new daily close (trailing not frozen) ─
 def test_highest_high_updates_on_new_high(tmp_path):
     orch, sm, _, parquet = _make(

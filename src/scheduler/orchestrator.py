@@ -348,6 +348,9 @@ class V2bOrchestrator:
             equity=equity,
             equity_src=equity_src,
             tsmc_signal=tsmc_signal,
+            # run_signal hasn't executed yet → state.position is pre-add; show
+            # the post-add total so "加碼至 N口" reflects current + add.
+            target_position=state.position + sig.contracts if sig.action == "add" else None,
         )
         self.notify_fn(msg)
 
@@ -683,6 +686,7 @@ class V2bOrchestrator:
         equity: float,
         tsmc_signal: TsmcSignal | None,
         equity_src: str = "估算",
+        target_position: int | None = None,
     ) -> str:
         """Build the rich LINE decision notification."""
         action = sig.action
@@ -697,7 +701,10 @@ class V2bOrchestrator:
         if action == "buy":
             action_line = f"BUY {action_contracts}口"
         elif action == "add":
-            action_line = f"ADD {action_contracts}口（加碼至 {state.position}口）"
+            # target = post-add total. run_signal passes it (state.position is
+            # still pre-add there); run_daily leaves it None (already mutated).
+            add_target = target_position if target_position is not None else state.position
+            action_line = f"ADD {action_contracts}口（加碼至 {add_target}口）"
         elif action in ("close", "sell"):
             action_line = f"CLOSE {closed_contracts}口"
         elif state.position > 0:
