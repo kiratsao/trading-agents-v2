@@ -32,15 +32,33 @@ class TradingState:
 
 
 class StateManager:
-    """Persist TradingState to a JSON file."""
+    """Persist TradingState to a JSON file.
 
-    def __init__(self, path: str = "data/paper_state.json") -> None:
+    Parameters
+    ----------
+    path :
+        Path to the JSON state file.
+    initial_equity :
+        Equity to use ONLY when the state file does not yet exist (first run
+        for an account) — should match the account's configured starting
+        capital from accounts.yaml. ``None`` (default) falls back to the
+        TradingState default, preserving the prior path-only behaviour. When a
+        state file already exists it is authoritative and this is ignored.
+    """
+
+    def __init__(
+        self,
+        path: str = "data/paper_state.json",
+        initial_equity: float | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.initial_equity = initial_equity
 
     # ------------------------------------------------------------------
     def load(self) -> TradingState:
         if not self.path.exists():
-            return TradingState()
+            equity = self.initial_equity if self.initial_equity is not None else 350_000.0
+            return TradingState(equity=equity)
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             s = raw.get("state", {})
