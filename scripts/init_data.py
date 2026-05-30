@@ -32,8 +32,8 @@ START_MONTH = 1
 _TAIFEX_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
 
 
-def fetch_taifex_month(year: int, month: int, product: str = "MTX") -> pd.DataFrame:
-    """Fetch one month of daily OHLCV from TAIFEX CSV download."""
+def _download_taifex_csv(year: int, month: int, product: str = "MTX") -> str:
+    """POST to TAIFEX futDataDown and return the decoded (big5) CSV body."""
     import calendar
 
     last_day = calendar.monthrange(year, month)[1]
@@ -55,8 +55,28 @@ def fetch_taifex_month(year: int, month: int, product: str = "MTX") -> pd.DataFr
     )
 
     with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("big5", errors="replace")
+        return resp.read().decode("big5", errors="replace")
 
+
+def _parse_taifex_csv(
+    raw: str, *, year: int | None = None, month: int | None = None
+) -> pd.DataFrame:
+    """Parse a TAIFEX futDataDown CSV body into a day-session daily OHLCV frame.
+
+    The ``交易時段`` column has two historical layouts, handled transparently:
+
+    * **單列 (舊格式, e.g. 2024-12)** — one row per (date, contract), labelled
+      ``一般``. That row *is* the day session (日盤 08:45–13:44).
+    * **雙列 (新格式, e.g. 2026-05)** — two rows per (date, contract):
+      ``一般`` carries the **night-session** close, ``盤後`` carries the
+      **day-session** close (verified to align with Shioaji's day close, e.g.
+      2026-05-28 盤後=45,249 vs 一般=43,846). We therefore prefer ``盤後`` and
+      fall back to ``一般`` when only the single row exists.
+
+    Unknown session labels are ranked last (chosen only if nothing known
+    exists) and a warning is printed — a future format change surfaces loudly
+    instead of silently selecting the wrong row.
+    """
     if not raw.strip() or "查無資料" in raw:
         return pd.DataFrame()
 
@@ -71,28 +91,42 @@ def fetch_taifex_month(year: int, month: int, product: str = "MTX") -> pd.DataFr
     if not required.issubset(df.columns):
         return pd.DataFrame()
 
-    # Filter: 一般 session only (exclude 盤後)
-    if "交易時段" in df.columns:
-        df = df[df["交易時段"].astype(str).str.strip() == "一般"]
-
-    # Filter: monthly contracts only (YYYYMM, 6 digits), exclude weekly (YYYYMMW1)
-    if "到期月份(週別)" in df.columns:
-        expire = df["到期月份(週別)"].astype(str).str.strip()
-        df = df[expire.str.match(r"^\d{6}$")]
-
-    # Keep only the nearest delivery month per date
-    if not df.empty and "到期月份(週別)" in df.columns:
-        df["_expire"] = df["到期月份(週別)"].astype(str).str.strip()
-        df["date"] = pd.to_datetime(df["交易日期"].astype(str).str.strip())
-        df = df.sort_values(["date", "_expire"])
-        df = df.drop_duplicates(subset=["date"], keep="first")
-        df = df.drop(columns=["_expire"])
-
+    # Parse date early — per-date session selection needs it.
+    df["date"] = pd.to_datetime(
+        df["交易日期"].astype(str).str.strip(), errors="coerce"
+    )
+    df = df.dropna(subset=["date"])
     if df.empty:
         return pd.DataFrame()
 
-    # Parse date: "2026/04/01" → datetime
-    df["date"] = pd.to_datetime(df["交易日期"].astype(str).str.strip())
+    # Filter: monthly contracts only (YYYYMM, 6 digits), exclude weekly (YYYYMMW1)
+    if "到期月份(週別)" in df.columns:
+        df["_expire"] = df["到期月份(週別)"].astype(str).str.strip()
+        df = df[df["_expire"].str.match(r"^\d{6}$")]
+    if df.empty:
+        return pd.DataFrame()
+
+    # Session selection: keep the day-session row per (date, contract).
+    # 盤後 (新格式日盤) > 一般 (舊格式日盤 / 新格式夜盤) > unknown.
+    if "交易時段" in df.columns:
+        df["_session"] = df["交易時段"].astype(str).str.strip()
+        rank = df["_session"].map({"盤後": 0, "一般": 1})
+        unknown = sorted(df.loc[rank.isna(), "_session"].unique())
+        if unknown:
+            where = f"{year}-{month:02d} " if year and month else ""
+            print(
+                f"  WARNING: {where}unknown TAIFEX 交易時段 labels {unknown} — "
+                f"ranked last; verify day-session alignment"
+            )
+        df["_sess_rank"] = rank.fillna(2)
+        subset = ["date"] + (["_expire"] if "_expire" in df.columns else [])
+        df = df.sort_values(subset + ["_sess_rank"])
+        df = df.drop_duplicates(subset=subset, keep="first")
+
+    # Keep only the nearest delivery month per date.
+    if "_expire" in df.columns:
+        df = df.sort_values(["date", "_expire"])
+        df = df.drop_duplicates(subset=["date"], keep="first")
 
     for col in ["開盤價", "最高價", "最低價", "收盤價", "成交量"]:
         df[col] = pd.to_numeric(
@@ -104,7 +138,7 @@ def fetch_taifex_month(year: int, month: int, product: str = "MTX") -> pd.DataFr
     if df.empty:
         return pd.DataFrame()
 
-    # Aggregate by date (near-month should be unique per day, but just in case)
+    # One row per date after selection — groupby is a defensive no-op.
     daily = df.groupby("date").agg(
         open=("開盤價", "first"),
         high=("最高價", "max"),
@@ -115,6 +149,12 @@ def fetch_taifex_month(year: int, month: int, product: str = "MTX") -> pd.DataFr
     daily.index = pd.to_datetime(daily.index)
     daily.index.name = "date"
     return daily
+
+
+def fetch_taifex_month(year: int, month: int, product: str = "MTX") -> pd.DataFrame:
+    """Fetch one month of day-session daily OHLCV from the TAIFEX CSV download."""
+    raw = _download_taifex_csv(year, month, product)
+    return _parse_taifex_csv(raw, year=year, month=month)
 
 
 def fetch_mxf() -> pd.DataFrame:

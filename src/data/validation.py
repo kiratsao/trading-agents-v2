@@ -69,6 +69,9 @@ def _default_shioaji_fetch(start: date, end: date) -> pd.DataFrame | None:
 
 
 def _default_taifex_fetch(start: date, end: date) -> pd.DataFrame | None:
+    # fetch_taifex_month already returns the *day-session* close (it prefers the
+    # 盤後 row in TAIFEX's dual-row format), so this ref aligns with Shioaji's
+    # day close — no extra session handling needed here.
     from scripts.init_data import fetch_taifex_month
     frames = []
     y, m = start.year, start.month
