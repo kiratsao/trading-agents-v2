@@ -7,9 +7,73 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 
-from src.scheduler.orchestrator import V2bOrchestrator
+from src.scheduler.orchestrator import V2bOrchestrator, _sync_position_from_broker
 from src.state.state_manager import StateManager, TradingState
 from src.strategy.v2b_engine import Signal, V2bEngine
+
+_NOSLEEP = lambda *_a, **_k: None  # noqa: E731 — injected to skip the 2s/3s waits
+
+
+class TestSyncPositionFromBroker:
+    """Unit coverage for the broker-truth position sync (2026-06-01 fix)."""
+
+    def test_returns_broker_actual_on_match(self):
+        broker = MagicMock()
+        broker.get_positions.return_value = [
+            {"code": "MXFF6", "direction": "Buy", "contracts": 5},
+        ]
+        notify = MagicMock()
+        assert _sync_position_from_broker(
+            broker, "MXF", 5, notify, sleep=_NOSLEEP,
+        ) == 5
+        notify.assert_not_called()  # exact match → no alert
+
+    def test_ioc_partial_returns_broker_truth_not_request(self):
+        """Requested total 45 but broker only holds 20 (IOC under-filled) →
+        return 20 (truth) + alert. This is the 2026-06-01 scenario."""
+        broker = MagicMock()
+        broker.get_positions.return_value = [
+            {"code": "MXFF6", "direction": "Buy", "contracts": 20},
+        ]
+        notify = MagicMock()
+        actual = _sync_position_from_broker(broker, "MXF", 45, notify, sleep=_NOSLEEP)
+        assert actual == 20
+        assert any("broker 為準" in c.args[0] for c in notify.call_args_list)
+
+    def test_retry_takes_later_read_when_fill_report_lags(self):
+        """First read is below expected (fill report lag), second read catches
+        up → take the later (higher) read."""
+        broker = MagicMock()
+        broker.get_positions.side_effect = [
+            [{"code": "MXFF6", "direction": "Buy", "contracts": 0}],   # lagging
+            [{"code": "MXFF6", "direction": "Buy", "contracts": 3}],   # settled
+        ]
+        notify = MagicMock()
+        assert _sync_position_from_broker(
+            broker, "MXF", 3, notify, sleep=_NOSLEEP,
+        ) == 3
+        assert broker.get_positions.call_count == 2
+
+    def test_broker_unreadable_returns_none_and_alerts(self):
+        broker = MagicMock()
+        broker.get_positions.side_effect = ConnectionError("api down")
+        notify = MagicMock()
+        assert _sync_position_from_broker(
+            broker, "MXF", 5, notify, sleep=_NOSLEEP,
+        ) is None
+        assert any("部位同步失敗" in c.args[0] for c in notify.call_args_list)
+
+    def test_excludes_non_mxf_and_shorts(self):
+        broker = MagicMock()
+        broker.get_positions.return_value = [
+            {"code": "MXFF6", "direction": "Buy", "contracts": 7},
+            {"code": "TXFF6", "direction": "Buy", "contracts": 3},   # other product
+            {"code": "MXFF6", "direction": "Sell", "contracts": 2},  # short leg
+        ]
+        notify = MagicMock()
+        assert _sync_position_from_broker(
+            broker, "MXF", 7, notify, sleep=_NOSLEEP,
+        ) == 7
 
 
 def _make_data(n=200):
@@ -236,9 +300,15 @@ class TestAddEntryPriceReconcile:
         )
         assert result.get("entry_price_source") == "broker"
 
-    def test_add_falls_back_to_local_weighted_avg(self):
-        """Broker.get_positions raises → use local weighted avg:
-        (13 × 40,532 + 2 × 42,415) / 15 = 40,783.0 (matches broker's)."""
+    def test_add_local_weighted_avg_when_broker_avg_unreadable(self):
+        """Position fill IS confirmed by the broker (15 lots) but the broker's
+        avg_price is unreadable (0.0) → entry falls back to the local weighted
+        avg: (13 × 40,532 + 2 × 42,415) / 15 = 40,783.0.
+
+        Post-fix: the position count always follows broker truth; only the
+        cost-basis falls back. (Was: a get_positions *exception* still bumped
+        to 15 — that optimistic bump is exactly the 2026-06-01 bug and is now
+        forbidden; see test_add_aborts_when_broker_unreadable.)"""
         state = TradingState(
             position=13, entry_price=40_532.0, contracts=13,
             equity=2_000_000.0,
@@ -249,10 +319,14 @@ class TestAddEntryPriceReconcile:
         broker.place_order.return_value = {
             "order_id": "ADD-2", "fill_price": 42_415.0,
         }
-        broker.get_positions.side_effect = ConnectionError("api down")
+        # Broker confirms the 15-lot fill but reports no usable avg_price.
+        broker.get_positions.return_value = [
+            {"code": "MXFE5", "direction": "Buy", "contracts": 15,
+             "avg_price": 0.0},
+        ]
 
         df = _make_data()
-        with patch.object(orch, "_load_data", return_value=df):
+        with patch("time.sleep"), patch.object(orch, "_load_data", return_value=df):
             result = orch.run_daily(broker=broker)
 
         assert state.position == 15
@@ -262,10 +336,11 @@ class TestAddEntryPriceReconcile:
         )
         assert result.get("entry_price_source") == "local"
 
-    def test_add_falls_back_when_broker_size_mismatches(self):
-        """Broker returns a position whose contracts don't match the
-        expected post-add total → discard the broker number, use local
-        weighted avg (broker may be mid-update / showing stale row)."""
+    def test_add_not_filled_keeps_position_no_runaway(self):
+        """2026-06-01 REGRESSION: broker still shows the pre-add 13 lots after
+        the add order (IOC did not fill). The local state MUST stay at 13 — the
+        old code blindly did state.position += add_n → 15 while the broker held
+        13, the exact runaway that pushed live state to 45 vs broker 20."""
         state = TradingState(
             position=13, entry_price=40_532.0, contracts=13,
             equity=2_000_000.0,
@@ -276,19 +351,45 @@ class TestAddEntryPriceReconcile:
         broker.place_order.return_value = {
             "order_id": "ADD-3", "fill_price": 42_415.0,
         }
-        # Broker reports stale 13-contract position; size mismatch.
+        # Broker shows the add did NOT fill — still 13 lots.
         broker.get_positions.return_value = [
             {"code": "MXFE5", "direction": "Buy", "contracts": 13,
              "avg_price": 40_532.0},
         ]
 
         df = _make_data()
-        with patch.object(orch, "_load_data", return_value=df):
+        with patch("time.sleep"), patch.object(orch, "_load_data", return_value=df):
             result = orch.run_daily(broker=broker)
 
-        expected = (13 * 40_532.0 + 2 * 42_415.0) / 15
-        assert abs(state.entry_price - expected) < 0.01
-        assert result.get("entry_price_source") == "local"
+        assert state.position == 13, "must NOT bump when broker confirms no fill"
+        assert state.entry_price == 40_532.0, "cost basis unchanged on no-fill"
+        assert result.get("add_contracts") == 0
+        alerts = [c.args[0] for c in orch.notify_fn.call_args_list]
+        assert any("加碼未成交" in m for m in alerts), alerts
+
+    def test_add_aborts_when_broker_unreadable(self):
+        """Broker.get_positions raises on both reads → cannot confirm the fill →
+        keep local state unchanged + loud alert (never optimistically bump)."""
+        state = TradingState(
+            position=13, entry_price=40_532.0, contracts=13,
+            equity=2_000_000.0,
+        )
+        sig = Signal("add", 2, "pyramid")
+        orch, _ = _make_orch(state, sig)
+        broker = MagicMock()
+        broker.place_order.return_value = {
+            "order_id": "ADD-4", "fill_price": 42_415.0,
+        }
+        broker.get_positions.side_effect = ConnectionError("api down")
+
+        df = _make_data()
+        with patch("time.sleep"), patch.object(orch, "_load_data", return_value=df):
+            result = orch.run_daily(broker=broker)
+
+        assert state.position == 13, "broker unreadable → state must not change"
+        assert result.get("add_contracts") == 0
+        alerts = [c.args[0] for c in orch.notify_fn.call_args_list]
+        assert any("部位同步失敗" in m for m in alerts), alerts
 
     def test_add_via_run_execution_uses_broker_avg(self):
         """run_execution (night_open phase 2) must apply the same

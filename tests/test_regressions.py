@@ -487,7 +487,11 @@ class TestRegressionSellFailAbortsBuy:
             "status": "Filled",
             "fill_price": 22000.0,
         }
-        broker.get_positions.return_value = [{"contracts": 5}]
+        # After the settlement Sell (5→0) and rollover Buy 4, the broker holds 4.
+        # State now follows broker truth, so get_positions must reflect the fill.
+        broker.get_positions.return_value = [
+            {"code": "MXFE5", "direction": "Buy", "contracts": 4, "avg_price": 22000.0},
+        ]
 
         notify_fn = MagicMock()
 
@@ -510,7 +514,7 @@ class TestRegressionSellFailAbortsBuy:
             live=False,
         )
 
-        with patch.object(orch, "_load_data", return_value=df):
+        with patch("time.sleep"), patch.object(orch, "_load_data", return_value=df):
             result = orch.run_execution(broker=broker, exec_price=22000.0)
 
         # Both sell and buy should be called

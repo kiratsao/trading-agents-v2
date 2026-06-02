@@ -122,20 +122,33 @@ class V2bOrchestrator:
         COST_PER_SIDE, TICK_VALUE = _load_execution_constants()
 
         if sig.action == "buy" and state.position == 0:
+            filled_n = sig.contracts
             if broker is not None:
                 order = broker.place_order("MXF", "Buy", sig.contracts)
                 result["order_id"] = order.get("order_id")
                 exec_price = order.get("fill_price", float(df["close"].iloc[-1]))
-                _reconcile_position(broker, sig.contracts, self.notify_fn)
+                # Source of truth = broker actual, NOT the requested quantity.
+                actual = _sync_position_from_broker(
+                    broker, "MXF", sig.contracts, self.notify_fn,
+                )
+                filled_n = actual if actual is not None else 0
             else:
                 exec_price = float(df["close"].iloc[-1])
-            state.equity -= COST_PER_SIDE * sig.contracts
-            state.position = sig.contracts
-            state.entry_price = exec_price
-            state.contracts = sig.contracts
-            state.highest_high = exec_price
-            result["entry_price"] = exec_price
-            _action_contracts = sig.contracts
+            if filled_n > 0:
+                state.equity -= COST_PER_SIDE * filled_n
+                state.position = filled_n
+                state.entry_price = exec_price
+                state.contracts = filled_n
+                state.highest_high = exec_price
+                result["entry_price"] = exec_price
+                _action_contracts = filled_n
+            else:
+                # IOC did not fill (or broker unreadable) → stay flat, no phantom
+                # entry. _sync_position_from_broker already alerted on a None read.
+                msg = f"🔴 進場未成交: Buy {sig.contracts}口 IOC 未成交，維持空倉"
+                logger.warning(msg)
+                self.notify_fn(msg)
+                result["filled"] = 0
 
         elif sig.action in ("close", "sell") and state.position > 0:
             closed_n = state.position
@@ -210,15 +223,29 @@ class V2bOrchestrator:
                             result["rollover_reason"] = f"buy order {buy_status}"
                         else:
                             buy_price = buy_order.get("fill_price", exec_price)
-                            _reconcile_position(broker, buy_n, self.notify_fn)
-                            state.equity -= COST_PER_SIDE * buy_n
-                            state.position = buy_n
-                            state.entry_price = buy_price
-                            state.contracts = buy_n
-                            state.highest_high = buy_price
-                            _action_contracts = buy_n
-                            result["rollover"] = True
-                            result["rollover_contracts"] = buy_n
+                            # Broker actual is source of truth (rollover from flat).
+                            actual = _sync_position_from_broker(
+                                broker, "MXF", buy_n, self.notify_fn,
+                            )
+                            filled_n = actual if actual is not None else 0
+                            if filled_n > 0:
+                                state.equity -= COST_PER_SIDE * filled_n
+                                state.position = filled_n
+                                state.entry_price = buy_price
+                                state.contracts = filled_n
+                                state.highest_high = buy_price
+                                _action_contracts = filled_n
+                                result["rollover"] = True
+                                result["rollover_contracts"] = filled_n
+                            else:
+                                msg = (
+                                    f"🔴 結算日轉倉買單未成交: Buy {buy_n}口 IOC 未成交，"
+                                    f"維持空倉"
+                                )
+                                logger.warning(msg)
+                                self.notify_fn(msg)
+                                result["rollover"] = False
+                                result["rollover_reason"] = "rollover buy IOC 未成交"
                     else:
                         buy_price = exec_price
                         state.equity -= COST_PER_SIDE * buy_n
@@ -238,27 +265,53 @@ class V2bOrchestrator:
 
         elif sig.action == "add" and state.position > 0:
             add_n = sig.contracts
+            old_n = state.position
             if broker is not None:
                 order = broker.place_order("MXF", "Buy", add_n)
                 result["order_id"] = order.get("order_id")
                 exec_price = order.get("fill_price", float(df["close"].iloc[-1]))
-                _reconcile_position(broker, state.position + add_n, self.notify_fn)
+                # Source of truth = broker actual. The 2026-06-01 bug was
+                # state.position += add_n regardless of fill: a 15-lot IOC that
+                # never filled pushed local 30→45 while broker stayed 20.
+                actual = _sync_position_from_broker(
+                    broker, "MXF", old_n + add_n, self.notify_fn,
+                )
+                filled = max(0, actual - old_n) if actual is not None else 0
+                if filled > 0:
+                    # Recompute cost basis with the ACTUAL filled qty BEFORE
+                    # mutating state.position (helper reads old_n = state.position).
+                    new_entry, entry_src = _reconcile_add_entry_price(
+                        broker, "MXF", state, filled, exec_price,
+                    )
+                    state.equity -= COST_PER_SIDE * filled
+                    state.position = actual
+                    state.contracts = actual
+                    state.pyramided = True
+                    result["add_contracts"] = filled
+                    result["entry_price"] = new_entry
+                    result["entry_price_source"] = entry_src
+                    _action_contracts = filled
+                else:
+                    # IOC add did not fill (or broker unreadable) → keep old_n.
+                    msg = (
+                        f"🔴 加碼未成交: Buy {add_n}口 IOC 未成交，維持 {old_n}口"
+                    )
+                    logger.warning(msg)
+                    self.notify_fn(msg)
+                    result["add_contracts"] = 0
             else:
                 exec_price = float(df["close"].iloc[-1])
-            # Update the cost basis BEFORE state.position is mutated: the
-            # helper uses the pre-add position size as old_n for the
-            # weighted-average calc / broker-size sanity check.
-            new_entry, entry_src = _reconcile_add_entry_price(
-                broker, "MXF", state, add_n, exec_price,
-            )
-            state.equity -= COST_PER_SIDE * add_n
-            state.position += add_n
-            state.contracts = state.position
-            state.pyramided = True
-            result["add_contracts"] = add_n
-            result["entry_price"] = new_entry
-            result["entry_price_source"] = entry_src
-            _action_contracts = add_n
+                new_entry, entry_src = _reconcile_add_entry_price(
+                    broker, "MXF", state, add_n, exec_price,
+                )
+                state.equity -= COST_PER_SIDE * add_n
+                state.position += add_n
+                state.contracts = state.position
+                state.pyramided = True
+                result["add_contracts"] = add_n
+                result["entry_price"] = new_entry
+                result["entry_price_source"] = entry_src
+                _action_contracts = add_n
 
         elif sig.action == "hold" and state.position > 0:
             # Update trailing stop / highest_high
@@ -444,16 +497,29 @@ class V2bOrchestrator:
         COST_PER_SIDE, TICK_VALUE = _load_execution_constants()
 
         if state.pending_action == "buy" and state.position == 0:
+            filled_n = state.pending_contracts
             if broker is not None:
                 order = broker.place_order("MXF", "Buy", state.pending_contracts)
                 result["order_id"] = order.get("order_id")
                 exec_price = order.get("fill_price", exec_price)
-                _reconcile_position(broker, state.pending_contracts, self.notify_fn)
-            state.equity -= COST_PER_SIDE * state.pending_contracts
-            state.position = state.pending_contracts
-            state.entry_price = exec_price
-            state.contracts = state.pending_contracts
-            state.highest_high = exec_price
+                # Source of truth = broker actual, NOT the requested quantity.
+                actual = _sync_position_from_broker(
+                    broker, "MXF", state.pending_contracts, self.notify_fn,
+                )
+                filled_n = actual if actual is not None else 0
+            if filled_n > 0:
+                state.equity -= COST_PER_SIDE * filled_n
+                state.position = filled_n
+                state.entry_price = exec_price
+                state.contracts = filled_n
+                state.highest_high = exec_price
+            else:
+                msg = (
+                    f"🔴 進場未成交: Buy {state.pending_contracts}口 IOC 未成交，維持空倉"
+                )
+                logger.warning(msg)
+                self.notify_fn(msg)
+                result["filled"] = 0
 
         elif state.pending_action == "close" and state.position > 0:
             closed_n = state.position
@@ -530,15 +596,29 @@ class V2bOrchestrator:
                                 result["rollover_reason"] = f"buy order {buy_status}"
                             else:
                                 buy_price = buy_order.get("fill_price", exec_price)
-                                _reconcile_position(broker, buy_n, self.notify_fn)
-                                state.equity -= COST_PER_SIDE * buy_n
-                                state.position = buy_n
-                                state.entry_price = buy_price
-                                state.contracts = buy_n
-                                state.highest_high = buy_price
-                                result["rollover"] = True
-                                result["rollover_contracts"] = buy_n
-                                result["rollover_price"] = buy_price
+                                # Broker actual is source of truth (rollover from flat).
+                                actual = _sync_position_from_broker(
+                                    broker, "MXF", buy_n, self.notify_fn,
+                                )
+                                filled_n = actual if actual is not None else 0
+                                if filled_n > 0:
+                                    state.equity -= COST_PER_SIDE * filled_n
+                                    state.position = filled_n
+                                    state.entry_price = buy_price
+                                    state.contracts = filled_n
+                                    state.highest_high = buy_price
+                                    result["rollover"] = True
+                                    result["rollover_contracts"] = filled_n
+                                    result["rollover_price"] = buy_price
+                                else:
+                                    msg = (
+                                        f"🔴 結算日轉倉買單未成交: Buy {buy_n}口 "
+                                        f"IOC 未成交，維持空倉"
+                                    )
+                                    logger.warning(msg)
+                                    self.notify_fn(msg)
+                                    result["rollover"] = False
+                                    result["rollover_reason"] = "rollover buy IOC 未成交"
                         else:
                             buy_price = exec_price
                             state.equity -= COST_PER_SIDE * buy_n
@@ -558,23 +638,45 @@ class V2bOrchestrator:
 
         elif state.pending_action == "add" and state.position > 0:
             add_n = state.pending_contracts
+            old_n = state.position
             if broker is not None:
                 order = broker.place_order("MXF", "Buy", add_n)
                 result["order_id"] = order.get("order_id")
                 exec_price = order.get("fill_price", exec_price)
-                _reconcile_position(broker, state.position + add_n, self.notify_fn)
-            # Update the cost basis BEFORE mutating state.position: the
-            # helper needs the pre-add size as old_n.
-            new_entry, entry_src = _reconcile_add_entry_price(
-                broker, "MXF", state, add_n, exec_price,
-            )
-            state.equity -= COST_PER_SIDE * add_n
-            state.position += add_n
-            state.contracts = state.position
-            state.pyramided = True
-            result["add_contracts"] = add_n
-            result["entry_price"] = new_entry
-            result["entry_price_source"] = entry_src
+                # Source of truth = broker actual (the 2026-06-01 runaway fix).
+                actual = _sync_position_from_broker(
+                    broker, "MXF", old_n + add_n, self.notify_fn,
+                )
+                filled = max(0, actual - old_n) if actual is not None else 0
+                if filled > 0:
+                    # Recompute cost basis with the ACTUAL filled qty BEFORE
+                    # mutating state.position (helper reads old_n = state.position).
+                    new_entry, entry_src = _reconcile_add_entry_price(
+                        broker, "MXF", state, filled, exec_price,
+                    )
+                    state.equity -= COST_PER_SIDE * filled
+                    state.position = actual
+                    state.contracts = actual
+                    state.pyramided = True
+                    result["add_contracts"] = filled
+                    result["entry_price"] = new_entry
+                    result["entry_price_source"] = entry_src
+                else:
+                    msg = f"🔴 加碼未成交: Buy {add_n}口 IOC 未成交，維持 {old_n}口"
+                    logger.warning(msg)
+                    self.notify_fn(msg)
+                    result["add_contracts"] = 0
+            else:
+                new_entry, entry_src = _reconcile_add_entry_price(
+                    broker, "MXF", state, add_n, exec_price,
+                )
+                state.equity -= COST_PER_SIDE * add_n
+                state.position += add_n
+                state.contracts = state.position
+                state.pyramided = True
+                result["add_contracts"] = add_n
+                result["entry_price"] = new_entry
+                result["entry_price_source"] = entry_src
 
         # Clear pending
         state.pending_action = None
@@ -1079,7 +1181,9 @@ def _persist_live_equity(broker, state: TradingState, state_mgr) -> tuple[float,
 def _reconcile_position(broker, expected_contracts: int, notify_fn) -> None:
     """Wait 2s then verify broker position matches expected contracts.
 
-    Non-blocking: logs confirmation or sends LINE alert on mismatch.
+    Non-blocking: logs confirmation or sends LINE alert on mismatch. Used by the
+    Sell/close paths (expected=0) where the order status already gates state;
+    the Buy/add/rollover paths use ``_sync_position_from_broker`` instead.
     """
     import time as _time
 
@@ -1098,6 +1202,86 @@ def _reconcile_position(broker, expected_contracts: int, notify_fn) -> None:
             notify_fn(msg)
     except Exception as exc:
         logger.warning("Position reconciliation failed: %s", exc)
+
+
+def _sync_position_from_broker(
+    broker,
+    product: str,
+    expected_total: int,
+    notify_fn,
+    *,
+    sleep=None,
+) -> int | None:
+    """Read the broker's ACTUAL total long position after an order and return
+    it as the source of truth — never trust the requested quantity.
+
+    This is the fix for the 2026-06-01 runaway: a 15-lot IOC market add never
+    filled, yet the local state was blindly bumped (state.position += add_n) to
+    45 lots while the broker held 20. An IOC/MKT order in the night session
+    routinely fills partially or not at all; the broker book is the only
+    authority for "what actually filled".
+
+    Timing (per ops decision): wait 2s for the fill report, read; if the read
+    is BELOW expected (the fill report can lag), retry ONCE after 3s and take
+    the later read. Never optimistically inflate.
+
+    Returns the broker's actual long contracts for *product* (int), or None when
+    the broker read failed on both attempts. On None the caller MUST leave local
+    state unchanged (conservative: never bump on an unverified order); a loud
+    LINE alert is sent here so the operator can reconcile manually.
+    """
+    import time as _time
+
+    _sleep = sleep or _time.sleep
+
+    def _read() -> int | None:
+        try:
+            positions = broker.get_positions()
+        except Exception as exc:
+            logger.warning("position sync: get_positions failed: %s", exc)
+            return None
+        total = 0
+        for p in positions:
+            if p.get("direction", "Buy") != "Buy":
+                continue
+            code = str(p.get("code", ""))
+            # Count long lots. A missing code is treated as ours (MXF-only
+            # orchestrator); an explicit non-MXF code is excluded.
+            if code and not code.startswith(product):
+                continue
+            total += int(p.get("contracts", p.get("quantity", 0)))
+        return total
+
+    _sleep(2)
+    actual = _read()
+    if actual is not None and actual < expected_total:
+        # Fill report may lag — give it one more read before trusting a low value.
+        _sleep(3)
+        retry = _read()
+        if retry is not None:
+            actual = retry
+
+    if actual is None:
+        msg = (
+            f"🔴 部位同步失敗: broker 部位讀取失敗，state 未更新 "
+            f"(預期 {expected_total}口)，請立即手動核對永豐部位"
+        )
+        logger.error(msg)
+        notify_fn(msg)
+        return None
+
+    if actual != expected_total:
+        logger.warning(
+            "position sync: expected=%d but broker=%d (IOC not fully filled) — "
+            "state will follow broker truth", expected_total, actual,
+        )
+        notify_fn(
+            f"⚠️ 部位以 broker 為準: 預期 {expected_total}口, 實際 broker={actual}口"
+            f"（IOC 未全部成交，已採實際值）"
+        )
+    else:
+        logger.info("position sync OK: broker=%d (matches expected)", actual)
+    return actual
 
 
 def _load_execution_constants() -> tuple[float, float]:
