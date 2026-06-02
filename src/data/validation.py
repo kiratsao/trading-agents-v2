@@ -68,10 +68,23 @@ def _default_shioaji_fetch(start: date, end: date) -> pd.DataFrame | None:
     return fetch_via_env(start, end, product="MXF")
 
 
-def _default_taifex_fetch(start: date, end: date) -> pd.DataFrame | None:
-    # fetch_taifex_month already returns the *day-session* close (it prefers the
-    # 盤後 row in TAIFEX's dual-row format), so this ref aligns with Shioaji's
-    # day close — no extra session handling needed here.
+def fetch_taifex_day_session_range(start: date, end: date) -> pd.DataFrame | None:
+    """TAIFEX official day-session (盤後) daily OHLCV over [start, end] INCLUSIVE.
+
+    Single authoritative TAIFEX-range fetch. Two callers share it:
+
+    * ``validate_latest_bar`` — as the independent *oracle* for cross-source
+      validation.
+    * ``daily_updater._fetch_and_aggregate`` — as the *data-source fallback*
+      when Shioaji has no day-session bars for a date (e.g. 2026-06-01 Shioaji
+      returned 839 night-only bars, 0 day-session). NOTE: when TAIFEX is used
+      as the source, validating it against this same oracle is circular and
+      degrades to self-validation — callers must surface that to the operator.
+
+    ``fetch_taifex_month`` already returns the *day-session* close (prefers the
+    盤後 row in TAIFEX's dual-row format), so it aligns with Shioaji's day close
+    — no extra session handling needed here. Returns None when nothing valid.
+    """
     from scripts.init_data import fetch_taifex_month
     frames = []
     y, m = start.year, start.month
@@ -86,7 +99,12 @@ def _default_taifex_fetch(start: date, end: date) -> pd.DataFrame | None:
         return None
     allf = _normalize(pd.concat(frames).sort_index())
     mask = (allf.index >= pd.Timestamp(start)) & (allf.index <= pd.Timestamp(end))
-    return allf[mask]
+    out = allf[mask]
+    return out if not out.empty else None
+
+
+# Backward-compat private alias (validate_latest_bar's fetcher-dict default).
+_default_taifex_fetch = fetch_taifex_day_session_range
 
 
 # ─────────────────────────────────────────────────────────────────────────────

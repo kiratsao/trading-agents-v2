@@ -98,7 +98,7 @@ def update(
         fetch_start, yesterday, today,
     )
     try:
-        new_bars = _fetch_and_aggregate(fetch_start, yesterday)
+        new_bars = _fetch_and_aggregate(fetch_start, yesterday, notify_fn=_notify)
     except Exception as exc:
         err = f"Shioaji fetch raised: {exc}"
         logger.error("🔴 資料更新失敗: %s", err)
@@ -297,7 +297,13 @@ def _detect_and_fill_gaps(
         [d.isoformat() for d in missing],
     )
 
-    fetcher = _fetch_override if _fetch_override is not None else _fetch_and_aggregate
+    if _fetch_override is not None:
+        fetcher = _fetch_override
+    else:
+        # Thread notify_fn so a per-day TAIFEX fallback during back-fill still
+        # surfaces the "no independent cross-validation" alert to the operator.
+        def fetcher(s: date, e: date) -> pd.DataFrame | None:
+            return _fetch_and_aggregate(s, e, notify_fn=notify_fn)
 
     filled = 0
     still_missing: list[date] = []
@@ -341,21 +347,66 @@ def _detect_and_fill_gaps(
     return filled, still_missing
 
 
-def _fetch_and_aggregate(start: date, end: date) -> pd.DataFrame | None:
-    """Fetch daily day-session OHLCV from Shioaji over [start, end] INCLUSIVE.
+def _fetch_and_aggregate(
+    start: date,
+    end: date,
+    notify_fn: Callable[[str], Any] | None = None,
+) -> pd.DataFrame | None:
+    """Fetch daily day-session OHLCV over [start, end] INCLUSIVE.
 
-    Thin delegator to the single authoritative fetcher in
-    ``src.data.shioaji_fetcher`` — all day-session filtering / aggregation /
-    settlement-exclusion lives there now, so there is exactly one place that
-    can be wrong (or right). Returns None when nothing valid was fetched.
+    Primary source is the single authoritative Shioaji fetcher in
+    ``src.data.shioaji_fetcher`` (all day-session filtering / aggregation /
+    settlement-exclusion lives there). When Shioaji yields NO day-session data
+    — empty *or* an exception (e.g. 2026-06-01: Shioaji returned 839 night-only
+    bars, 0 day-session; TAIFEX had the normal 45,055 day close) — fall back to
+    TAIFEX's official daily download so the parquet does not stall.
+
+    ``notify_fn`` (optional) receives a LINE alert when the TAIFEX fallback is
+    used. The alert MUST state that the bar came from TAIFEX and has no
+    independent cross-validation: the cross-source validator's TAIFEX oracle
+    would then be comparing TAIFEX-against-TAIFEX (circular → trivially "ok").
+
+    Returns None when neither source has valid day-session data.
     """
     from src.data.shioaji_fetcher import fetch_via_env
 
-    daily = fetch_via_env(start, end, product="MXF")
-    if daily is None or daily.empty:
-        logger.info("daily_updater: Shioaji returned empty day-session data")
+    daily = None
+    try:
+        daily = fetch_via_env(start, end, product="MXF")
+    except Exception as exc:
+        logger.warning(
+            "daily_updater: Shioaji fetch raised (%s) — trying TAIFEX fallback", exc,
+        )
+
+    if daily is not None and not daily.empty:
+        return daily
+
+    # ── TAIFEX fallback (Shioaji empty/raised) ───────────────────────────────
+    logger.warning(
+        "daily_updater: Shioaji day-session empty for %s→%s — using TAIFEX fallback",
+        start, end,
+    )
+    from src.data.validation import fetch_taifex_day_session_range
+
+    try:
+        tx = fetch_taifex_day_session_range(start, end)
+    except Exception as exc:
+        logger.error("daily_updater: TAIFEX fallback raised: %s", exc)
+        tx = None
+
+    if tx is None or tx.empty:
+        logger.info("daily_updater: both Shioaji and TAIFEX returned empty")
         return None
-    return daily
+
+    rng = f"{start}" if start == end else f"{start}~{end}"
+    msg = (
+        f"⚠️ {rng} 日盤改用 TAIFEX 補（Shioaji 缺日盤）\n"
+        f"此 bar 來自 TAIFEX，無獨立交叉驗證"
+    )
+    logger.warning("daily_updater: TAIFEX fallback filled %s (%d bars)", rng, len(tx))
+    if notify_fn is not None:
+        notify_fn(msg)
+    return tx
 
 
 def update_all(
@@ -460,7 +511,13 @@ def ensure_parquet_fresh(
 
     parquet_path = Path(parquet_path or _PRIMARY_PARQUET)
     _notify = notify_fn or (lambda msg: None)
-    fetch = fetch_override or _fetch_and_aggregate
+    if fetch_override is not None:
+        fetch = fetch_override
+    else:
+        # Thread _notify so a TAIFEX fallback during freshness back-fill still
+        # surfaces the "no independent cross-validation" alert.
+        def fetch(s: date, e: date) -> pd.DataFrame | None:
+            return _fetch_and_aggregate(s, e, notify_fn=_notify)
     _sleep = sleep or _time.sleep
 
     target = expected_parquet_latest(now)

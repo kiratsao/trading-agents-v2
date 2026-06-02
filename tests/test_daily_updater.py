@@ -4,12 +4,78 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pandas as pd
 import pytest
 
-from src.data.daily_updater import update
+from src.data.daily_updater import _fetch_and_aggregate, update
+
+
+def _one_day_frame(day: str, close: float) -> pd.DataFrame:
+    ts = pd.Timestamp(day)
+    df = pd.DataFrame(
+        {"open": [close], "high": [close], "low": [close],
+         "close": [close], "volume": [45055]},
+        index=pd.DatetimeIndex([ts], name="date"),
+    )
+    return df
+
+
+class TestTaifexFallback:
+    """Task 1: when Shioaji has no day-session data (2026-06-01 class), the
+    fetch must fall back to TAIFEX and loudly flag the missing cross-validation.
+    """
+
+    def test_shioaji_empty_falls_back_to_taifex(self):
+        notes: list[str] = []
+        d = date(2026, 6, 1)
+        with (
+            patch("src.data.shioaji_fetcher.fetch_via_env",
+                  return_value=pd.DataFrame()),
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=_one_day_frame("2026-06-01", 45055.0)) as mock_tx,
+        ):
+            out = _fetch_and_aggregate(d, d, notify_fn=notes.append)
+
+        assert out is not None and not out.empty
+        assert float(out["close"].iloc[-1]) == 45055.0
+        mock_tx.assert_called_once_with(d, d)
+        # Must surface that the bar is unvalidated (user requirement).
+        assert any("TAIFEX" in m and "無獨立交叉驗證" in m for m in notes), notes
+
+    def test_shioaji_exception_falls_back_to_taifex(self):
+        d = date(2026, 6, 1)
+        with (
+            patch("src.data.shioaji_fetcher.fetch_via_env",
+                  side_effect=RuntimeError("creds missing")),
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=_one_day_frame("2026-06-01", 45055.0)),
+        ):
+            out = _fetch_and_aggregate(d, d)
+        assert out is not None and float(out["close"].iloc[-1]) == 45055.0
+
+    def test_shioaji_present_skips_taifex(self):
+        d = date(2026, 6, 2)
+        with (
+            patch("src.data.shioaji_fetcher.fetch_via_env",
+                  return_value=_one_day_frame("2026-06-02", 44900.0)),
+            patch("src.data.validation.fetch_taifex_day_session_range") as mock_tx,
+        ):
+            out = _fetch_and_aggregate(d, d)
+        assert out is not None and float(out["close"].iloc[-1]) == 44900.0
+        mock_tx.assert_not_called()
+
+    def test_both_empty_returns_none(self):
+        d = date(2026, 6, 1)
+        with (
+            patch("src.data.shioaji_fetcher.fetch_via_env",
+                  return_value=pd.DataFrame()),
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=None),
+        ):
+            out = _fetch_and_aggregate(d, d)
+        assert out is None
 
 
 def _make_existing_parquet(path: Path, last_date: str = "2026-04-07") -> None:
@@ -66,8 +132,11 @@ class TestDailyUpdater:
         assert result["error"] is None
         df = pd.read_parquet(pq)
         assert len(df) == 4
-        # Fetch range should be start→yesterday (2026-04-08)
-        mock_fetch.assert_called_once_with(date(2026, 4, 8), date(2026, 4, 8))
+        # Fetch range should be start→yesterday (2026-04-08). notify_fn is
+        # threaded so a TAIFEX fallback can surface its no-cross-validation alert.
+        mock_fetch.assert_called_once_with(
+            date(2026, 4, 8), date(2026, 4, 8), notify_fn=ANY,
+        )
 
     def test_only_fetches_up_to_yesterday(self, tmp_path):
         """Core fix: today=2026-04-08 (Tuesday) → fetch only up to 2026-04-07."""
@@ -326,7 +395,7 @@ class TestGapDetection:
 
         per_date_calls: list[date] = []
 
-        def fake_fetch(start: date, end: date):
+        def fake_fetch(start: date, end: date, notify_fn=None):
             per_date_calls.append(start)
             return pd.DataFrame(
                 {"open": [33500.0], "high": [33700.0], "low": [33400.0],
@@ -357,7 +426,7 @@ class TestGapDetection:
         _seed_parquet_with_hole(pq, hole_date="2026-04-01", anchor="2026-04-07")
         notify = MagicMock()
 
-        def fake_fetch(start: date, end: date):
+        def fake_fetch(start: date, end: date, notify_fn=None):
             # Main append (2026-04-08) succeeds; gap back-fill returns None.
             if start == date(2026, 4, 8):
                 return pd.DataFrame(
