@@ -143,6 +143,9 @@ class V2bEngine:
             raise ValueError(f"exit_mode must be 'trailing' or 'chandelier', got {exit_mode!r}")
 
         self.product = product
+        # NTD per index point — read by main.py startup notification and
+        # orchestrator PnL display. MXF/MTX=50, TX/TXF=200 (see _TICK_VALUE).
+        self.point_value = _TICK_VALUE[product]
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.atr_period = atr_period
