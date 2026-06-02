@@ -100,7 +100,7 @@ accounts:
       - {equity:   9830000, contracts: 81}
       - {equity:   9950000, contracts: 82}
     margin_per_contract: 131500   # TAIFEX 2026-04-27 調整
-    max_contracts: 999            # 無硬上限 — 由 floor(equity/margin) 與券商額度自然限制
+    max_contracts: 20             # 硬上限封頂 20 口 (2026-06-01 reconcile 失控事件後設) — 仍受 floor(equity/margin) 與券商額度約束
     settlement_force_close: true
     sessions:
       day:
