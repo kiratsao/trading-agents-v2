@@ -38,3 +38,22 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
         (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
     )
     return dx.ewm(span=period, adjust=False).mean()
+
+
+def wma(series: pd.Series, period: int) -> pd.Series:
+    """Weighted Moving Average."""
+    weights = np.arange(1, period + 1)
+    return series.rolling(period).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+
+def hma(series: pd.Series, period: int) -> pd.Series:
+    """Hull Moving Average."""
+    half_len = int(period / 2)
+    sqrt_len = int(np.sqrt(period))
+    
+    wma_half = wma(series, half_len)
+    wma_full = wma(series, period)
+    
+    diff = 2 * wma_half - wma_full
+    
+    return wma(diff, sqrt_len)
