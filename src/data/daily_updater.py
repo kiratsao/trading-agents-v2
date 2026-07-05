@@ -76,6 +76,24 @@ def update(
     today = _today_taipei()
     yesterday = _last_trading_day(today)
 
+    # Future-dated bar = corruption (a night-session row written as a day K).
+    # Left alone it makes every subsequent run "already up-to-date" and
+    # silently blocks real bars — alert loudly instead.
+    if last_date > today:
+        err = (
+            f"🔴 parquet 損毀: 最新 bar {last_date} 在未來 (today={today}) — "
+            f"疑夜盤資料寫成日K,請重建 (scripts/init_data.py)"
+        )
+        logger.error(err)
+        _notify(err)
+        return {
+            "success": False,
+            "bars_added": 0,
+            "gaps_filled": 0,
+            "latest_date": str(last_date),
+            "error": err,
+        }
+
     if fetch_start > yesterday:
         logger.info("daily_updater: already up-to-date (last=%s)", last_date)
         # Tail-already-current doesn't mean the whole look-back window is

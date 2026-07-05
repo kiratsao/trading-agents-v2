@@ -81,9 +81,10 @@ def fetch_taifex_day_session_range(start: date, end: date) -> pd.DataFrame | Non
       as the source, validating it against this same oracle is circular and
       degrades to self-validation — callers must surface that to the operator.
 
-    ``fetch_taifex_month`` already returns the *day-session* close (prefers the
-    盤後 row in TAIFEX's dual-row format), so it aligns with Shioaji's day close
-    — no extra session handling needed here. Returns None when nothing valid.
+    ``fetch_taifex_month`` already returns the *day-session* close (keeps the
+    一般 row and drops 盤後/night rows in TAIFEX's dual-row format), so it
+    aligns with Shioaji's day close — no extra session handling needed here.
+    Returns None when nothing valid.
     """
     from scripts.init_data import fetch_taifex_month
     frames = []

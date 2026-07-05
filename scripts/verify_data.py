@@ -58,6 +58,12 @@ def main():
 
     trading_gap = len(trading_days_between(latest, today)) - 1  # exclude latest itself
     calendar_gap = (today - latest).days
+    if latest > today:
+        issues.append(
+            f"FUTURE BAR: latest={latest} is after today={today} — "
+            f"a night-session (盤後) row was written as a day K; rebuild with "
+            f"scripts/init_data.py"
+        )
     if trading_gap > 3:
         issues.append(
             f"STALE: latest={latest}, today={today}, "

@@ -75,24 +75,24 @@ python scripts/init_data.py
 python scripts/verify_data.py
 ```
 
-## V2b Backtest Baseline (2020-01-02 → 2026-04-08, MXF, capital=350K, with settlement rollover)
+## V2b Backtest Baseline (2020-01-02 → 2026-07-03, MXF, capital=350K, with settlement rollover)
 
 Strategy: EMA(30/100), CD2, ATR×2.0 trailing, ADX(14)>25, Anti-Martingale, settlement rollover
 
 | Metric | Value |
 |--------|------:|
-| CAGR_% | **57.80%** |
-| MDD_% | **-21.54%** |
-| Sharpe | **1.768** |
-| Calmar | **2.684** |
-| Win_Rate_% | **64.29%** |
-| Profit_Factor | **3.561** |
-| Total_Trades | 70 |
-| Final_Equity | 6,089,660 NTD |
+| CAGR_% | **59.64%** |
+| MDD_% | **-21.85%** |
+| Sharpe | **1.76** |
+| Calmar | **2.73** |
+| Win_Rate_% | **63.64%** |
+| Profit_Factor | **3.12** |
+| Total_Trades | 77 |
+| Final_Equity | 7,308,420 NTD |
 
-> ⚠️ 2026-07-04 起結算日改為假日順延 (2023-01 → 1/30、2026-02 → 2/23 各多一筆
-> 結算轉倉)，且休市表補入颱風/封關日 — 上表為舊邏輯數值，需在 GCP 用乾淨
-> parquet 重跑後更新。
+> 2026-07-05 重跑：含結算日假日順延 (2023-01-30、2026-02-23 各多一筆結算轉倉)、
+> 颱風/封關休市表；資料 = TAIFEX `一般`(日盤) 重建，與 Shioaji 日盤聚合
+> 1559/1560 個交易日 OHLCV 精確一致交叉驗證。
 
 ## Key Conventions
 
@@ -102,6 +102,9 @@ Strategy: EMA(30/100), CD2, ATR×2.0 trailing, ADX(14)>25, Anti-Martingale, sett
 - **Settlement day** = 第三個週三，遇 TAIFEX 假日**順延至次一交易日**
   (`tw_holidays.settlement_day_of_month`)；only forces close on existing positions
 - **日K聚合** strictly 08:45-13:44, sort by ts, close = last chronological bar
+- **TAIFEX CSV 時段**: `一般`=該日**日盤**(保留)、`盤後`=前日**夜盤**記次一交易日
+  (一律丟棄，即使該日只有盤後列)。2020→2026 從未翻轉；勿再用 Shioaji 偶發回傳的
+  夜盤 bar 當驗證 oracle (6bdd195 教訓)
 - **時間**: 業務邏輯禁用裸 `datetime.now()`/`date.today()` — 一律
   `src.utils.tw_time.now_taipei()/today_taipei()` (GCP VM 時區不保證是台北)
 - **LINE 通知**: 一律經 `src.notify.line.build_line_notifier()` — 🔴/⚠️ 告警

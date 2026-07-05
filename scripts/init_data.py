@@ -63,19 +63,25 @@ def _parse_taifex_csv(
 ) -> pd.DataFrame:
     """Parse a TAIFEX futDataDown CSV body into a day-session daily OHLCV frame.
 
-    The ``交易時段`` column has two historical layouts, handled transparently:
+    ``交易時段`` semantics — stable across 2020→2026, verified by exact-OHLCV
+    match against the Shioaji day-session parquet on 2020-06-15, 2023-06-15,
+    2025-06-16, 2026-05-28/29:
 
-    * **單列 (舊格式, e.g. 2024-12)** — one row per (date, contract), labelled
-      ``一般``. That row *is* the day session (日盤 08:45–13:44).
-    * **雙列 (新格式, e.g. 2026-05)** — two rows per (date, contract):
-      ``一般`` carries the **night-session** close, ``盤後`` carries the
-      **day-session** close (verified to align with Shioaji's day close, e.g.
-      2026-05-28 盤後=45,249 vs 一般=43,846). We therefore prefer ``盤後`` and
-      fall back to ``一般`` when only the single row exists.
+    * ``一般`` — 該交易日的日盤 (08:45–13:45). The row we keep.
+    * ``盤後`` — 前一交易日 15:00 起的夜盤, booked by TAIFEX to the **next**
+      trading date. Never a day session — dropped outright. Consequence: a
+      date whose day session hasn't traded yet (e.g. Monday's 盤後 row is
+      published right after Friday's night session ends) yields NO bar,
+      instead of a night bar masquerading as a future day K.
 
-    Unknown session labels are ranked last (chosen only if nothing known
-    exists) and a warning is printed — a future format change surfaces loudly
-    instead of silently selecting the wrong row.
+    Commit 6bdd195 had this inverted — its "Shioaji day close" oracle was
+    itself a night-session fetch. Disproof via 2026-06-08: 盤後 low 40,761 is
+    exactly -10% of the 06-05 settlement (weekend night session limit-down),
+    while 一般 42,318→43,060 is Monday's actual day session.
+
+    Unknown session labels are ranked after ``一般`` and a warning is printed
+    — a future format change surfaces loudly instead of silently selecting
+    the wrong row.
     """
     if not raw.strip() or "查無資料" in raw:
         return pd.DataFrame()
@@ -106,19 +112,23 @@ def _parse_taifex_csv(
     if df.empty:
         return pd.DataFrame()
 
-    # Session selection: keep the day-session row per (date, contract).
-    # 盤後 (新格式日盤) > 一般 (舊格式日盤 / 新格式夜盤) > unknown.
+    # Session selection: 一般 = 日盤 (keep); 盤後 = 夜盤 booked to the next
+    # trading date (drop outright — never a valid day bar, even when it is
+    # the only row for a date). Unknown labels rank after 一般, with a warning.
     if "交易時段" in df.columns:
         df["_session"] = df["交易時段"].astype(str).str.strip()
-        rank = df["_session"].map({"盤後": 0, "一般": 1})
+        df = df[df["_session"] != "盤後"]
+        if df.empty:
+            return pd.DataFrame()
+        rank = df["_session"].map({"一般": 0})
         unknown = sorted(df.loc[rank.isna(), "_session"].unique())
         if unknown:
             where = f"{year}-{month:02d} " if year and month else ""
             print(
                 f"  WARNING: {where}unknown TAIFEX 交易時段 labels {unknown} — "
-                f"ranked last; verify day-session alignment"
+                f"ranked after 一般; verify day-session alignment"
             )
-        df["_sess_rank"] = rank.fillna(2)
+        df["_sess_rank"] = rank.fillna(1)
         subset = ["date"] + (["_expire"] if "_expire" in df.columns else [])
         df = df.sort_values(subset + ["_sess_rank"])
         df = df.drop_duplicates(subset=subset, keep="first")
