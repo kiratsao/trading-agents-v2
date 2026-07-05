@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import csv
 import logging
-from datetime import date
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -169,7 +168,9 @@ def track_pnl() -> dict | None:
     # Total profit adds back what has already been withdrawn so realised payouts
     # are not mistaken for losses: (equity + Σwithdrawn) − Σcapital.
     total_pnl = (equity + total_withdrawn) - total_capital
-    today_str = str(date.today())
+    from src.utils.tw_time import today_taipei
+
+    today_str = str(today_taipei())
 
     result = {
         "date": today_str,

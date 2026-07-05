@@ -421,7 +421,7 @@ class TestGapDetection:
 
     def test_gap_alert_on_failure(self, tmp_path):
         """Back-fill fetcher returns None for the gap day → LINE alert
-        with ⚠️ {date} 資料缺失 marker; success=False."""
+        with ⚠️ {date} 日K缺失 marker; success=False."""
         pq = tmp_path / "test.parquet"
         _seed_parquet_with_hole(pq, hole_date="2026-04-01", anchor="2026-04-07")
         notify = MagicMock()
@@ -450,7 +450,7 @@ class TestGapDetection:
         assert "unfilled" in (result["error"] or "")
         alerts = [c.args[0] for c in notify.call_args_list]
         assert any(
-            "2026-04-01" in m and "資料缺失" in m and "⚠️" in m
+            "2026-04-01" in m and "日K缺失" in m and "⚠️" in m
             for m in alerts
         ), f"expected unfilled-gap alert, got: {alerts}"
 

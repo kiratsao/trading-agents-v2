@@ -21,6 +21,21 @@ if [ -f "$PID_FILE" ]; then
     fi
 fi
 
+# Guard: systemd daemon already running? Two daemons = every scheduled job
+# (and every LINE message) fires twice — refuse to double-start.
+if command -v systemctl &>/dev/null && systemctl is-active --quiet trading-agents-v2 2>/dev/null; then
+    echo "❌ systemd 的 trading-agents-v2 已在跑 — 不重複啟動第二個 daemon"
+    echo "   (要用手動模式請先: sudo systemctl stop trading-agents-v2)"
+    exit 1
+fi
+
+# Guard: any other scheduler.main process alive (e.g. started by hand)?
+if pgrep -f "python.*-m src\.scheduler\.main" >/dev/null 2>&1; then
+    echo "❌ 已有 src.scheduler.main process 在跑 — 不重複啟動"
+    pgrep -fl "python.*-m src\.scheduler\.main"
+    exit 1
+fi
+
 mkdir -p "$PROJECT_DIR/logs"
 
 cd "$PROJECT_DIR"

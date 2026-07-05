@@ -56,7 +56,9 @@ def fetch_prices(
     -------
     FetchedPrices or None if any fetch fails.
     """
-    today = today or date.today()
+    from src.utils.tw_time import today_taipei
+
+    today = today or today_taipei()
     cache_key = str(today)
     if not force_refresh and cache_key in _CACHE:
         return _CACHE[cache_key]  # type: ignore[return-value]

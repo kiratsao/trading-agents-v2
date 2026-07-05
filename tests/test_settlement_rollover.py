@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from src.strategy.v2b_engine import V2bEngine
+from src.utils.tw_time import today_taipei
 
 
 def _make_bull_data(n=200, settlement_date="2025-04-16"):
@@ -142,6 +143,7 @@ class TestSettlementRolloverOrchestrator:
             equity=400_000,
             pending_action="close",
             pending_contracts=2,
+            pending_signal_date=today_taipei().isoformat(),
             pending_reason="settlement-day force close",
         )
         state_mgr.load.return_value = state
@@ -197,6 +199,7 @@ class TestSettlementRolloverOrchestrator:
             equity=400_000,
             pending_action="close",
             pending_contracts=2,
+            pending_signal_date=today_taipei().isoformat(),
             pending_reason="settlement-day force close",
         )
         state_mgr.load.return_value = state

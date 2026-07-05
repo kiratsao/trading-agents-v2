@@ -37,24 +37,10 @@ _STATE = Path("data/paper_state.json")
 
 
 def _send_line(msg: str) -> None:
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    uid = os.environ.get("LINE_USER_ID", "")
-    if not token or not uid:
-        return
-    import urllib.request
-    payload = json.dumps({"to": uid, "messages": [{"type": "text", "text": msg}]})
-    req = urllib.request.Request(
-        "https://api.line.me/v2/bot/message/push",
-        data=payload.encode(),
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-    except Exception as exc:
-        logger.warning("LINE alert failed: %s", exc)
+    """Shared deduped LINE notifier (see src/notify/line.py)."""
+    from src.notify.line import build_line_notifier
+
+    build_line_notifier()(msg)
 
 
 def _refresh_state_equity_from_broker() -> str:

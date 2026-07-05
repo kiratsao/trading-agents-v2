@@ -12,6 +12,13 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from src.data.daily_updater import update
+from src.utils.tw_time import today_taipei
+
+
+def _today_taipei_str() -> str:
+    """Valid pending_signal_date for fixtures — run_execution discards
+    pendings whose signal date is not today (stale-pending guard)."""
+    return today_taipei().isoformat()
 
 
 class TestRegressionFugleImportCleaned:
@@ -220,7 +227,7 @@ class TestRegressionMktOrderBatchSplit:
         adapter._accounts = []
         return adapter
 
-    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    @patch("shioaji.Order")
     def test_submit_order_splits_over_5(self, mock_order_cls):
         """Market order > 5 contracts must be split into batches of 5."""
         adapter = self._make_adapter()
@@ -245,7 +252,7 @@ class TestRegressionMktOrderBatchSplit:
         assert "ORD-1" in result["order_id"]
         assert "ORD-3" in result["order_id"]
 
-    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    @patch("shioaji.Order")
     def test_submit_order_no_split_under_limit(self, mock_order_cls):
         """Orders <= 5 contracts should NOT be split."""
         adapter = self._make_adapter()
@@ -260,7 +267,7 @@ class TestRegressionMktOrderBatchSplit:
         adapter._api.place_order.assert_called_once()
         assert result["contracts"] == 5
 
-    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    @patch("shioaji.Order")
     def test_6_contracts_splits_into_2_batches(self, mock_order_cls):
         """6 contracts = 5 + 1 → 2 batches."""
         adapter = self._make_adapter()
@@ -282,7 +289,7 @@ class TestRegressionMktOrderBatchSplit:
         assert call_count == 2
         assert result["contracts"] == 6
 
-    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    @patch("shioaji.Order")
     def test_limit_order_not_split(self, mock_order_cls):
         """Limit orders should NOT be split regardless of quantity."""
         adapter = self._make_adapter()
@@ -297,7 +304,7 @@ class TestRegressionMktOrderBatchSplit:
         adapter._api.place_order.assert_called_once()
         assert result["contracts"] == 20
 
-    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    @patch("shioaji.Order")
     def test_split_exact_multiple(self, mock_order_cls):
         """10 contracts = exactly 2 batches of 5, no remainder."""
         adapter = self._make_adapter()
@@ -338,9 +345,7 @@ class TestRegressionSettlementDayContract:
         adapter._api.Contracts.Futures.MXF = [expiring, next_month]
 
         fake_today = dt.date(2026, 5, 20)
-        with patch("datetime.date") as mock_date:
-            mock_date.today.return_value = fake_today
-            mock_date.side_effect = lambda *a, **kw: dt.date(*a, **kw)
+        with patch("src.utils.tw_time.today_taipei", return_value=fake_today):
             contract = adapter.get_contract("MXF")
 
         assert contract.code == "MXFG6"
@@ -359,9 +364,7 @@ class TestRegressionSettlementDayContract:
         adapter._api.Contracts.Futures.MXF = [near, far]
 
         fake_today = dt.date(2026, 5, 19)
-        with patch("datetime.date") as mock_date:
-            mock_date.today.return_value = fake_today
-            mock_date.side_effect = lambda *a, **kw: dt.date(*a, **kw)
+        with patch("src.utils.tw_time.today_taipei", return_value=fake_today):
             contract = adapter.get_contract("MXF")
 
         assert contract.code == "MXFE6"
@@ -383,6 +386,7 @@ class TestRegressionSellFailAbortsBuy:
             equity=1_200_000,
             pending_action="close",
             pending_contracts=13,
+            pending_signal_date=_today_taipei_str(),
             pending_reason="settlement-day force close",
         )
         state_mgr.load.return_value = state
@@ -393,7 +397,11 @@ class TestRegressionSellFailAbortsBuy:
             "order_id": "REJECTED-1",
             "status": "Failed",
         }
-        broker.get_positions.return_value = []
+        # Broker still holds the 13-lot long (the sell never filled).
+        broker.get_positions.return_value = [
+            {"code": "MXFE5", "direction": "Buy", "contracts": 13,
+             "avg_price": 20500.0},
+        ]
 
         notify_fn = MagicMock()
         strategy = MagicMock()
@@ -436,13 +444,18 @@ class TestRegressionSellFailAbortsBuy:
             equity=900_000,
             pending_action="close",
             pending_contracts=7,
+            pending_signal_date=_today_taipei_str(),
             pending_reason="settlement-day force close",
         )
         state_mgr.load.return_value = state
 
         broker = MagicMock()
         broker.place_order.side_effect = Exception("超過市價單筆委託上限")
-        broker.get_positions.return_value = []
+        # Broker still holds the 7-lot long (order raised, nothing filled).
+        broker.get_positions.return_value = [
+            {"code": "MXFE5", "direction": "Buy", "contracts": 7,
+             "avg_price": 21000.0},
+        ]
 
         notify_fn = MagicMock()
         strategy = MagicMock()
@@ -477,6 +490,7 @@ class TestRegressionSellFailAbortsBuy:
             equity=800_000,
             pending_action="close",
             pending_contracts=5,
+            pending_signal_date=_today_taipei_str(),
             pending_reason="settlement-day force close",
         )
         state_mgr.load.return_value = state
@@ -487,10 +501,13 @@ class TestRegressionSellFailAbortsBuy:
             "status": "Filled",
             "fill_price": 22000.0,
         }
-        # After the settlement Sell (5→0) and rollover Buy 4, the broker holds 4.
-        # State now follows broker truth, so get_positions must reflect the fill.
-        broker.get_positions.return_value = [
-            {"code": "MXFE5", "direction": "Buy", "contracts": 4, "avg_price": 22000.0},
+        # Position reads in chronological order: pre-sell guard sees the 5-lot
+        # long, the post-sell reconcile sees flat, the post-rollover-buy sync
+        # sees the new 4-lot fill (state follows broker truth).
+        broker.get_positions.side_effect = [
+            [{"code": "MXFE5", "direction": "Buy", "contracts": 5, "avg_price": 21000.0}],
+            [],
+            [{"code": "MXFE5", "direction": "Buy", "contracts": 4, "avg_price": 22000.0}],
         ]
 
         notify_fn = MagicMock()
@@ -529,7 +546,7 @@ class TestRegressionSellFailAbortsBuy:
 class TestRegressionSettlementBatchOrder:
     """13 口 → 分批 5+5+3（結算日場景完整測試）。"""
 
-    @patch("shioaji.Order", new_callable=lambda: MagicMock)
+    @patch("shioaji.Order")
     def test_13_contracts_split_5_5_3(self, mock_order_cls):
         from tw_futures.executor.shioaji_adapter import ShioajiAdapter
 

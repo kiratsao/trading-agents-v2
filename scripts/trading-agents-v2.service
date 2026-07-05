@@ -1,28 +1,38 @@
 [Unit]
-Description=V2b MTX Auto-Trading (Paper)
-Documentation=https://github.com/kira/trading-agents
-After=network.target
+Description=V2b MXF Auto-Trading Daemon
+Documentation=https://github.com/kiratsao/trading-agents-v2
+After=network-online.target
 Wants=network-online.target
+
+# 範本 — 與 GCP 上實際的 /etc/systemd/system/trading-agents-v2.service 對齊。
+# 修改後: sudo systemctl daemon-reload && sudo systemctl restart trading-agents-v2
 
 [Service]
 Type=simple
-User=kira
-Group=kira
-WorkingDirectory=/Users/kira/trading-agents
-ExecStart=/Users/kira/trading-agents/.venv/bin/python -m src.scheduler.main
+User=tommychau286
+Group=tommychau286
+WorkingDirectory=/home/tommychau286/trading-agents-v2
+ExecStart=/usr/bin/python3 -m src.scheduler.main --live
 ExecStop=/bin/kill -SIGTERM $MAINPID
 
-# Restart policy
+# Restart policy — crash-loop 時 startup 通知已有 30 分鐘抑制 (src/notify/line.py)
 Restart=on-failure
 RestartSec=30
 StartLimitInterval=300
 StartLimitBurst=5
 
+# ── 記憶體防線 (e2-small 1.9GB; daemon RSS 曾從 360MB 洩漏到 880MB) ──
+# MemoryMax: 超過即 OOM-kill 本 service（由 Restart 拉起來），避免拖垮整台 VM
+# RuntimeMaxSec: 每 7 天計畫性重啟一次，把洩漏的 RSS 歸零（每天 05:00 重啟
+#   亦可，但 7 天配合 startup 通知較不吵）。要啟用請取消註解。
+#MemoryMax=1300M
+#RuntimeMaxSec=604800
+
 # Environment
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/Users/kira/trading-agents/.env
+EnvironmentFile=/home/tommychau286/trading-agents-v2/.env
 
-# Logging — output goes to journald; use `journalctl -u trading-agents-v2` to view
+# Logging — journalctl -u trading-agents-v2 檢視
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trading-agents-v2

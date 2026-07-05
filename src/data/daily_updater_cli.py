@@ -12,9 +12,7 @@ for 2 days when it crash-looped). Exit codes are for systemd to act on:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -24,28 +22,11 @@ logger = logging.getLogger("daily_updater_cli")
 
 
 def _line_notifier():
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    uid = os.environ.get("LINE_USER_ID", "")
-    if not token or not uid:
-        return None
+    """Shared deduped notifier — same journal as the daemon, so an alert the
+    daemon's 14:25 pass already sent is not re-sent by this 14:30 timer."""
+    from src.notify.line import build_line_notifier
 
-    def _send(msg: str) -> None:
-        import urllib.request
-
-        payload = json.dumps({"to": uid, "messages": [{"type": "text", "text": msg}]})
-        req = urllib.request.Request(
-            "https://api.line.me/v2/bot/message/push",
-            data=payload.encode(),
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10):
-                pass
-        except Exception as exc:
-            logger.warning("LINE alert failed: %s", exc)
-
-    return _send
+    return build_line_notifier()
 
 
 def main(argv=None) -> int:

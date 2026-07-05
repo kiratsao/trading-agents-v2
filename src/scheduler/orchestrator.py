@@ -13,7 +13,6 @@ night_open：
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +22,7 @@ from src.signals.fetcher import fetch_prices
 from src.signals.tsmc_tracker import TsmcSignal, compute_signal
 from src.state.state_manager import StateManager, TradingState
 from src.strategy.v2b_engine import V2bEngine
+from src.utils.tw_time import now_taipei, today_taipei
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,95 @@ class V2bOrchestrator:
         self.decision_time = decision_time
         self.execution_timing = execution_timing
         self.live = live
+
+    # ------------------------------------------------------------------
+    # Public: broker reconcile (state 自動同步)
+    # ------------------------------------------------------------------
+
+    def reconcile_state_with_broker(self, broker, *, sleep=None) -> bool:
+        """Adopt the broker's actual position when local state disagrees.
+
+        Called at daemon startup and before every 14:30 signal so manual App
+        operations (open/close outside the daemon) and exchange-side events
+        (cash settlement) no longer require hand-editing the state JSON.
+        Broker book is the source of truth. Returns True when state changed.
+        """
+        if broker is None:
+            return False
+        import time as _time
+
+        _sleep = sleep or _time.sleep
+        state = self.state_mgr.load()
+        product = self.strategy.product
+        actual = _read_broker_long(broker, product)
+        if actual is None:
+            self.notify_fn(
+                f"⚠️ state/broker 對帳失敗: 無法讀取 broker 部位 "
+                f"(state={state.position}口)，state 未變更"
+            )
+            return False
+        if actual == state.position:
+            logger.info(
+                "reconcile: state matches broker (%d口) — no change", actual
+            )
+            return False
+
+        if actual == 0 and state.position > 0:
+            # Guard against a transient empty read wiping a real position:
+            # require a second confirming read before adopting 0.
+            _sleep(3)
+            confirm = _read_broker_long(broker, product)
+            if confirm != 0:
+                self.notify_fn(
+                    f"⚠️ broker 部位讀取不穩定（0 → {confirm}），state 未變更，"
+                    f"請人工核對永豐 App"
+                )
+                return False
+
+        old_pos, old_entry = state.position, state.entry_price
+        if actual == 0:
+            state.position = 0
+            state.contracts = 0
+            state.entry_price = None
+            state.highest_high = None
+            state.pyramided = False
+            desc = f"{old_pos}口 → 空倉（App 手動平倉或已結算）"
+        else:
+            avg = _query_broker_avg_price(broker, product, actual)
+            if avg is None and state.position == 0:
+                # Fresh manual position but no readable cost basis — cannot
+                # seed entry_price/trailing stop safely. Leave state alone
+                # and ask for a manual sync (scripts/sync_state.py).
+                self.notify_fn(
+                    f"⚠️ broker 有 {actual}口 但 state 空倉，且無法讀取均價 — "
+                    f"state 未變更，請跑 scripts/sync_state.py 手動同步"
+                )
+                return False
+            state.position = actual
+            state.contracts = actual
+            if avg is not None and avg > 0:
+                state.entry_price = avg
+            if state.highest_high is None and state.entry_price is not None:
+                state.highest_high = state.entry_price
+            if old_pos == 0:
+                state.entry_date = today_taipei().isoformat()
+                state.pyramided = False
+            entry_str = (
+                f"{state.entry_price:,.0f}" if state.entry_price else "未知"
+            )
+            desc = f"{old_pos}口 → {actual}口 @ {entry_str}"
+
+        self.state_mgr.save(state)
+        msg = (
+            f"⚙️ state 已自動同步 broker: {desc}\n"
+            f"(原 state: {old_pos}口 @ {old_entry or 0:,.0f}；"
+            f"若此同步有誤請立即人工核對)"
+        )
+        logger.warning(msg)
+        # ⚙️ prefix is not alert-class → never deduped; every actual state
+        # change stays visible even if identical to a recent one.
+        self.notify_fn(msg)
+        return True
 
     # ------------------------------------------------------------------
     # Public: single-phase (next_open)
@@ -154,22 +243,48 @@ class V2bOrchestrator:
             closed_n = state.position
             is_settlement = "settlement" in sig.reason
             sell_ok = True
+            already_flat = False
             if broker is not None:
-                try:
-                    order = broker.place_order("MXF", "Sell", closed_n)
-                except Exception as exc:
-                    logger.error("Sell order failed: %s", exc)
-                    order = {"order_id": "FAILED", "status": "Failed"}
-                result["order_id"] = order.get("order_id")
-                sell_status = order.get("status", "")
-                if sell_status in ("Failed", "Cancelled", "Inactive"):
-                    sell_ok = False
-                    msg = f"🔴 平倉失敗: Sell {closed_n}口 status={sell_status}"
-                    logger.error(msg)
+                # Pre-sell guard — see run_execution: never sell what the
+                # broker no longer holds (settled / manually closed).
+                broker_actual = _read_broker_long(broker, "MXF")
+                if broker_actual == 0:
+                    msg = (
+                        f"⚠️ 平倉時 broker 已無多單（手動平倉或已結算）— 不下單，"
+                        f"state {closed_n}口 已同步為空倉"
+                    )
+                    logger.warning(msg)
                     self.notify_fn(msg)
-                else:
-                    exec_price = order.get("fill_price", float(df["close"].iloc[-1]))
-                    _reconcile_position(broker, 0, self.notify_fn)
+                    state.position = 0
+                    state.entry_price = None
+                    state.contracts = 0
+                    state.highest_high = None
+                    state.pyramided = False
+                    sell_ok = False
+                    already_flat = True
+                    result["already_flat"] = True
+                elif broker_actual is not None and 0 < broker_actual < closed_n:
+                    self.notify_fn(
+                        f"⚠️ broker 只持有 {broker_actual}口（state {closed_n}口）— "
+                        f"只平 {broker_actual}口"
+                    )
+                    closed_n = broker_actual
+                if not already_flat:
+                    try:
+                        order = broker.place_order("MXF", "Sell", closed_n)
+                    except Exception as exc:
+                        logger.error("Sell order failed: %s", exc)
+                        order = {"order_id": "FAILED", "status": "Failed"}
+                    result["order_id"] = order.get("order_id")
+                    sell_status = order.get("status", "")
+                    if sell_status in ("Failed", "Cancelled", "Inactive"):
+                        sell_ok = False
+                        msg = f"🔴 平倉失敗: Sell {closed_n}口 status={sell_status}"
+                        logger.error(msg)
+                        self.notify_fn(msg)
+                    else:
+                        exec_price = order.get("fill_price", float(df["close"].iloc[-1]))
+                        _reconcile_position(broker, 0, self.notify_fn)
             else:
                 exec_price = float(df["close"].iloc[-1])
 
@@ -330,6 +445,7 @@ class V2bOrchestrator:
             equity=equity,
             equity_src=equity_src,
             tsmc_signal=tsmc_signal,
+            data_date=df.index[-1].date(),
         )
         self.notify_fn(msg)
         return result
@@ -355,6 +471,18 @@ class V2bOrchestrator:
         if not is_fresh:
             self.notify_fn(fresh_msg)
             logger.warning("Data freshness check: %s", fresh_msg)
+
+        # Loudly flag a decision that is about to be made on a stale bar
+        # (previously a Shioaji outage silently degraded to T-1 data with
+        # only a log line — the LINE message looked current but wasn't).
+        last_bar_date = df.index[-1].date()
+        data_stale = self._alert_if_stale(last_bar_date)
+
+        # Broker reconcile BEFORE the signal so manual App operations and
+        # exchange-side cash settlement are absorbed automatically instead
+        # of requiring the stop-daemon / edit-JSON / restart manual SOP.
+        if self.live and broker is not None:
+            self.reconcile_state_with_broker(broker)
 
         state = self.state_mgr.load()
         # Cache the latest live equity into state when broker can serve it.
@@ -384,8 +512,7 @@ class V2bOrchestrator:
         )
 
         # Save pending intent
-        tz_cst = timezone(timedelta(hours=8))
-        today_str = datetime.now(tz=tz_cst).strftime("%Y-%m-%d")
+        today_str = now_taipei().strftime("%Y-%m-%d")
         state.pending_action = sig.action
         state.pending_contracts = sig.contracts
         state.pending_signal_date = today_str
@@ -404,6 +531,8 @@ class V2bOrchestrator:
             # run_signal hasn't executed yet → state.position is pre-add; show
             # the post-add total so "加碼至 N口" reflects current + add.
             target_position=state.position + sig.contracts if sig.action == "add" else None,
+            data_date=last_bar_date,
+            data_stale=data_stale,
         )
         self.notify_fn(msg)
 
@@ -467,6 +596,28 @@ class V2bOrchestrator:
         # refreshes the cached equity snapshot.
         _persist_live_equity(broker, state, self.state_mgr)
 
+        # Stale-pending guard: a pending intent is only valid on the day its
+        # signal was computed. If run_signal errored today (no data / crash)
+        # yesterday's intent would otherwise survive and execute at today's
+        # price — discard it loudly instead.
+        if state.pending_action and state.pending_action != "hold":
+            today_str = now_taipei().strftime("%Y-%m-%d")
+            if state.pending_signal_date != today_str:
+                msg = (
+                    f"🔴 過期 pending 已丟棄: {state.pending_action} "
+                    f"{state.pending_contracts}口 "
+                    f"(signal_date={state.pending_signal_date}, today={today_str})"
+                    f" — 不執行，等下一次 14:30 信號"
+                )
+                logger.error(msg)
+                self.notify_fn(msg)
+                state.pending_action = None
+                state.pending_signal_date = None
+                state.pending_contracts = 0
+                state.pending_reason = None
+                self.state_mgr.save(state)
+                return {"action": "stale_pending_discarded"}
+
         # No pending action or explicit hold
         if (not state.pending_action) or state.pending_action == "hold":
             # Still update highest_high if in position
@@ -526,6 +677,38 @@ class V2bOrchestrator:
             is_settlement = "settlement" in (state.pending_reason or "")
             sell_ok = True
             if broker is not None:
+                # Pre-sell guard: never sell more than the broker actually
+                # holds. On settlement day the expired contract may already be
+                # cash-settled (broker flat) and get_contract() would resolve
+                # the Sell to the NEXT month — opening a naked short. A manual
+                # App close leaves the same trap.
+                broker_actual = _read_broker_long(broker, "MXF")
+                if broker_actual == 0:
+                    msg = (
+                        f"⚠️ 平倉時 broker 已無多單（手動平倉或已結算）— 不下單，"
+                        f"state {closed_n}口 已同步為空倉"
+                    )
+                    logger.warning(msg)
+                    self.notify_fn(msg)
+                    state.position = 0
+                    state.entry_price = None
+                    state.contracts = 0
+                    state.highest_high = None
+                    state.pyramided = False
+                    state.pending_action = None
+                    state.pending_signal_date = None
+                    state.pending_contracts = 0
+                    state.pending_reason = None
+                    self.state_mgr.save(state)
+                    _persist_live_equity(broker, state, self.state_mgr)
+                    result["action"] = "close_already_flat"
+                    return result
+                if broker_actual is not None and 0 < broker_actual < closed_n:
+                    self.notify_fn(
+                        f"⚠️ broker 只持有 {broker_actual}口（state {closed_n}口）— "
+                        f"只平 {broker_actual}口"
+                    )
+                    closed_n = broker_actual
                 try:
                     order = broker.place_order("MXF", "Sell", closed_n)
                 except Exception as exc:
@@ -692,8 +875,7 @@ class V2bOrchestrator:
         _persist_live_equity(broker, state, self.state_mgr)
 
         # LINE execution notification
-        tz_cst = timezone(timedelta(hours=8))
-        exec_time = datetime.now(tz=tz_cst).strftime("%H:%M")
+        exec_time = now_taipei().strftime("%H:%M")
         action = result["action"]
         if action == "buy":
             action_desc = f"BUY {result['contracts']}×MXF @ {exec_price:.0f}"
@@ -728,6 +910,33 @@ class V2bOrchestrator:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _alert_if_stale(self, last_bar_date) -> bool:
+        """Live mode: loudly flag a decision made without today's bar.
+
+        Returns True when today is a trading day but the latest bar is older —
+        i.e. the Shioaji today-bar fetch failed and we silently degraded to
+        T-1. On a settlement day this is escalated: the force-close trigger
+        keys off the bar's date, so stale data can silently skip settlement
+        handling entirely.
+        """
+        from src.strategy.v2b_engine import _is_settlement_day
+        from src.utils.freshness import is_trading_day
+
+        today = today_taipei()
+        if not (self.live and is_trading_day(today) and last_bar_date != today):
+            return False
+        if _is_settlement_day(pd.Timestamp(today)):
+            self.notify_fn(
+                f"🔴 結算日但未取得今日({today})日盤資料，決策基於 {last_bar_date} — "
+                f"結算平倉判斷可能失效，請人工確認部位"
+            )
+        else:
+            self.notify_fn(
+                f"⚠️ 未取得今日({today})日盤資料，決策基於 {last_bar_date} 收盤"
+                f"（Shioaji 可能斷線）"
+            )
+        return True
 
     def _check_data_freshness(self) -> tuple[bool, str]:
         """Delegate to the single source of truth (src.utils.freshness).
@@ -789,6 +998,8 @@ class V2bOrchestrator:
         tsmc_signal: TsmcSignal | None,
         equity_src: str = "估算",
         target_position: int | None = None,
+        data_date=None,
+        data_stale: bool = False,
     ) -> str:
         """Build the rich LINE decision notification."""
         action = sig.action
@@ -826,8 +1037,7 @@ class V2bOrchestrator:
         tsmc_line = f"TSMC信號: {tsmc_signal}" if tsmc_signal else ""
 
         sep = "━━━━━━━━━━━━"
-        tz_cst = timezone(timedelta(hours=8))
-        now = datetime.now(tz=tz_cst).strftime("%Y-%m-%d")
+        now = now_taipei().strftime("%Y-%m-%d")
 
         # Unrealized PnL line (only when holding)
         pnl_line = ""
@@ -841,11 +1051,21 @@ class V2bOrchestrator:
                 f"({unrealized_pct:+.1f}%)"
             )
 
+        # Label the close with its bar date so a stale close is visibly stale
+        # instead of masquerading as today's.
+        close_line = f"台指收盤: {close:,.0f}"
+        if data_date is not None:
+            close_line += f" ({data_date})"
+
         lines = [
             sep,
             f"📊 激進帳戶 {now} 決策  {self.decision_time}",
+        ]
+        if data_stale:
+            lines.append(f"⚠️ 資料非今日（{data_date}），判斷可能過時")
+        lines += [
             f"動作: {action_line}",
-            f"台指收盤: {close:,.0f}",
+            close_line,
         ]
         if pnl_line:
             lines.append(pnl_line)
@@ -972,7 +1192,6 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
     Returns a dict with open/high/low/close/volume/date, or None on failure.
     """
     import os
-    from datetime import date
 
     # Reuse existing broker connection if available
     owns_adapter = broker is None
@@ -997,7 +1216,9 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
             logger.debug("_fetch_today_bar_shioaji: broker creation failed: %s", exc)
             return None
 
-    today = date.today()
+    # Taipei calendar date — the VM's local date can lag a day (UTC) between
+    # 00:00–08:00 Taipei, which would make Shioaji return the wrong session.
+    today = today_taipei()
 
     # --- Primary: authoritative day-session bar (single source of truth) ---
     try:
@@ -1137,10 +1358,11 @@ def _reconcile_add_entry_price(
 
     broker_avg = _query_broker_avg_price(broker, product, new_n) if broker is not None else None
     if broker_avg is not None and broker_avg > 0:
+        old_entry = state.entry_price
         state.entry_price = broker_avg
         logger.info(
-            "add reconcile: state.entry_price updated from broker avg = %.2f (was %.2f, +%d口)",
-            broker_avg, state.entry_price, add_n,
+            "add reconcile: state.entry_price updated from broker avg = %.2f (was %s, +%d口)",
+            broker_avg, f"{old_entry:.2f}" if old_entry else "None", add_n,
         )
         return broker_avg, "broker"
 
@@ -1178,7 +1400,28 @@ def _persist_live_equity(broker, state: TradingState, state_mgr) -> tuple[float,
     return equity, src
 
 
-def _reconcile_position(broker, expected_contracts: int, notify_fn) -> None:
+def _read_broker_long(broker, product: str) -> int | None:
+    """Broker's actual total LONG contracts for *product*, or None when the
+    read fails. Filters direction=Buy and matches contract code by prefix so
+    other products / short legs never pollute the count (the old
+    ``_reconcile_position`` summed everything, shorts included)."""
+    try:
+        positions = broker.get_positions()
+    except Exception as exc:
+        logger.warning("broker position read failed: %s", exc)
+        return None
+    total = 0
+    for p in positions:
+        if p.get("direction", "Buy") != "Buy":
+            continue
+        code = str(p.get("code", ""))
+        if code and not code.startswith(product):
+            continue
+        total += int(p.get("contracts", p.get("quantity", 0)))
+    return total
+
+
+def _reconcile_position(broker, expected_contracts: int, notify_fn, product: str = "MXF") -> None:
     """Wait 2s then verify broker position matches expected contracts.
 
     Non-blocking: logs confirmation or sends LINE alert on mismatch. Used by the
@@ -1188,20 +1431,19 @@ def _reconcile_position(broker, expected_contracts: int, notify_fn) -> None:
     import time as _time
 
     _time.sleep(2)
-    try:
-        positions = broker.get_positions()
-        actual = sum(p.get("contracts", p.get("quantity", 0)) for p in positions)
-        if actual == expected_contracts:
-            logger.info(
-                "Position reconciliation OK: expected=%d, actual=%d",
-                expected_contracts, actual,
-            )
-        else:
-            msg = f"⚠️ 持倉不一致: 預期 {expected_contracts} 口, 實際 {actual} 口"
-            logger.warning(msg)
-            notify_fn(msg)
-    except Exception as exc:
-        logger.warning("Position reconciliation failed: %s", exc)
+    actual = _read_broker_long(broker, product)
+    if actual is None:
+        logger.warning("Position reconciliation failed: broker unreadable")
+        return
+    if actual == expected_contracts:
+        logger.info(
+            "Position reconciliation OK: expected=%d, actual=%d",
+            expected_contracts, actual,
+        )
+    else:
+        msg = f"⚠️ 持倉不一致: 預期 {expected_contracts} 口, 實際 {actual} 口"
+        logger.warning(msg)
+        notify_fn(msg)
 
 
 def _sync_position_from_broker(
@@ -1235,22 +1477,7 @@ def _sync_position_from_broker(
     _sleep = sleep or _time.sleep
 
     def _read() -> int | None:
-        try:
-            positions = broker.get_positions()
-        except Exception as exc:
-            logger.warning("position sync: get_positions failed: %s", exc)
-            return None
-        total = 0
-        for p in positions:
-            if p.get("direction", "Buy") != "Buy":
-                continue
-            code = str(p.get("code", ""))
-            # Count long lots. A missing code is treated as ours (MXF-only
-            # orchestrator); an explicit non-MXF code is excluded.
-            if code and not code.startswith(product):
-                continue
-            total += int(p.get("contracts", p.get("quantity", 0)))
-        return total
+        return _read_broker_long(broker, product)
 
     _sleep(2)
     actual = _read()

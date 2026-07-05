@@ -10,6 +10,7 @@ import pandas as pd
 from src.scheduler.orchestrator import V2bOrchestrator, _sync_position_from_broker
 from src.state.state_manager import StateManager, TradingState
 from src.strategy.v2b_engine import Signal, V2bEngine
+from src.utils.tw_time import today_taipei
 
 _NOSLEEP = lambda *_a, **_k: None  # noqa: E731 — injected to skip the 2s/3s waits
 
@@ -133,7 +134,11 @@ class TestRunDailyClose:
         orch, _ = _make_orch(state, sig)
         broker = MagicMock()
         broker.place_order.return_value = {"order_id": "2", "fill_price": 21000.0}
-        broker.get_positions.return_value = []
+        # Pre-sell guard reads the live 2-lot long; post-sell reconcile sees flat.
+        broker.get_positions.side_effect = [
+            [{"code": "MXFE5", "direction": "Buy", "contracts": 2, "avg_price": 20000.0}],
+            [],
+        ]
 
         df = _make_data()
         with patch.object(orch, "_load_data", return_value=df):
@@ -398,6 +403,7 @@ class TestAddEntryPriceReconcile:
             position=13, entry_price=40_532.0, contracts=13,
             equity=2_000_000.0,
             pending_action="add", pending_contracts=2,
+            pending_signal_date=today_taipei().isoformat(),
         )
         # Strategy.generate_signal won't be called from run_execution,
         # so the signal_override is irrelevant; pass a placeholder.

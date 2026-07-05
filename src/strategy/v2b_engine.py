@@ -87,8 +87,17 @@ def _third_wednesday(dt_date: date) -> date:
 
 
 def _is_settlement_day(ts: pd.Timestamp) -> bool:
-    """True if *ts* falls on the 3rd Wednesday of its month (TAIFEX monthly expiry)."""
-    return ts.date() == _third_wednesday(ts.date())
+    """True if *ts* is the TAIFEX monthly settlement day.
+
+    Delegates to the holiday-aware shared implementation: the 3rd Wednesday
+    defers to the next trading day when it lands on a TAIFEX holiday (e.g.
+    2026-02-18 in the Chinese New Year break). The old bare 3rd-Wednesday
+    compare silently skipped settlement in such months — the bar never exists
+    on the holiday, so the force-close never fired.
+    """
+    from src.data.tw_holidays import is_settlement_date
+
+    return is_settlement_date(ts.date())
 
 
 class V2bEngine:

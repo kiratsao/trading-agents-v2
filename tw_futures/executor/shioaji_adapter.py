@@ -308,10 +308,13 @@ class ShioajiAdapter:
                 f"Available: {dir(self._api.Contracts.Futures)}"
             )
 
-        # contracts is iterable; pick the nearest delivery month
-        import datetime as _dt
+        # contracts is iterable; pick the nearest delivery month.
+        # Taipei date, NOT the VM's local date — on a UTC host the local date
+        # lags Taipei by a day between 00:00–08:00 Taipei, which would keep an
+        # already-expired contract selectable overnight after settlement day.
+        from src.utils.tw_time import today_taipei
 
-        today_str = _dt.date.today().strftime("%Y/%m/%d")
+        today_str = today_taipei().strftime("%Y/%m/%d")
 
         valid = [c for c in contracts if c.delivery_date > today_str]
         if not valid:

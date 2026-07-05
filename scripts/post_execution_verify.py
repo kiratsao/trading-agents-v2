@@ -28,38 +28,18 @@ logger = logging.getLogger(__name__)
 
 
 def _build_notifier():
+    """Shared deduped LINE notifier (falls back to print when LINE unset)."""
     try:
         from dotenv import load_dotenv
 
         load_dotenv()
     except ImportError:
         pass
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    user_id = os.environ.get("LINE_USER_ID", "")
-    if not token or not user_id:
+    if not (os.environ.get("LINE_CHANNEL_ACCESS_TOKEN") and os.environ.get("LINE_USER_ID")):
         return lambda msg: print(msg)
+    from src.notify.line import build_line_notifier
 
-    def _notify(msg: str) -> None:
-        import json as _json
-        import urllib.request
-
-        payload = {"to": user_id, "messages": [{"type": "text", "text": msg}]}
-        req = urllib.request.Request(
-            "https://api.line.me/v2/bot/message/push",
-            data=_json.dumps(payload).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10):
-                pass
-        except Exception as exc:
-            logger.warning("LINE notify failed: %s", exc)
-
-    return _notify
+    return build_line_notifier()
 
 
 def run_verify(skip_external: bool = False, notify_fn=None) -> dict:

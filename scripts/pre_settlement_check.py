@@ -33,64 +33,46 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _third_wednesday(dt_date: date) -> date:
-    import calendar
-
-    y, m = dt_date.year, dt_date.month
-    c = calendar.monthcalendar(y, m)
-    wednesdays = [week[calendar.WEDNESDAY] for week in c if week[calendar.WEDNESDAY] != 0]
-    return date(y, m, wednesdays[2])
-
-
 def _next_settlement_day(from_date: date) -> date:
-    """Return the next settlement day (3rd Wednesday) on or after from_date."""
-    settle = _third_wednesday(from_date)
+    """Next holiday-adjusted settlement day on or after *from_date*.
+
+    Shares the single implementation in src.data.tw_holidays (the old local
+    copy ignored holidays and could drift from the engine's logic).
+    """
+    from src.data.tw_holidays import settlement_day_of_month
+
+    settle = settlement_day_of_month(from_date)
     if settle >= from_date:
         return settle
     # Move to next month
     if from_date.month == 12:
-        return _third_wednesday(date(from_date.year + 1, 1, 1))
-    return _third_wednesday(date(from_date.year, from_date.month + 1, 1))
+        return settlement_day_of_month(date(from_date.year + 1, 1, 1))
+    return settlement_day_of_month(date(from_date.year, from_date.month + 1, 1))
 
 
 def _build_notifier():
-    try:
-        from dotenv import load_dotenv
+    """Shared deduped LINE notifier (falls back to print when LINE unset)."""
+    import os as _os
 
-        load_dotenv()
-    except ImportError:
-        pass
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    user_id = os.environ.get("LINE_USER_ID", "")
-    if not token or not user_id:
-        return lambda msg: print(msg)
+    from src.notify.line import build_line_notifier
 
-    def _notify(msg: str) -> None:
-        import json as _json
-        import urllib.request
-
-        payload = {"to": user_id, "messages": [{"type": "text", "text": msg}]}
-        req = urllib.request.Request(
-            "https://api.line.me/v2/bot/message/push",
-            data=_json.dumps(payload).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+    if not (_os.environ.get("LINE_CHANNEL_ACCESS_TOKEN") and _os.environ.get("LINE_USER_ID")):
         try:
-            with urllib.request.urlopen(req, timeout=10):
-                pass
-        except Exception as exc:
-            logger.warning("LINE notify failed: %s", exc)
+            from dotenv import load_dotenv
 
-    return _notify
+            load_dotenv()
+        except ImportError:
+            pass
+    if not (_os.environ.get("LINE_CHANNEL_ACCESS_TOKEN") and _os.environ.get("LINE_USER_ID")):
+        return lambda msg: print(msg)
+    return build_line_notifier()
 
 
 def run_check(skip_external: bool = False, notify_fn=None) -> dict:
     """Run all pre-settlement checks. Returns dict with results."""
-    today = date.today()
+    from src.utils.tw_time import today_taipei
+
+    today = today_taipei()
     tomorrow = today + timedelta(days=1)
     next_settle = _next_settlement_day(tomorrow)
 

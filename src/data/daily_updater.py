@@ -317,7 +317,10 @@ def _detect_and_fill_gaps(
 
         if bar is None or bar.empty:
             still_missing.append(d)
-            warn = f"⚠️ {d.isoformat()} 資料缺失，需手動處理 (自動補回失敗)"
+            # Wording must stay in sync with ensure_parquet_fresh's alert:
+            # identical text lets the shared notify dedup collapse the
+            # daemon (14:25) and systemd-timer (14:30) copies into one.
+            warn = f"⚠️ {d.isoformat()} 日K缺失，自動補回失敗 — 需手動處理"
             logger.warning(warn)
             notify_fn(warn)
             continue
@@ -342,7 +345,7 @@ def _detect_and_fill_gaps(
         df.to_parquet(parquet_path, index=True)
         filled += 1
         logger.info("daily_updater: back-filled %s", d)
-        notify_fn(f"✅ {d.isoformat()} 資料補回成功")
+        notify_fn(f"✅ {d.isoformat()} 日K補回成功")
 
     return filled, still_missing
 
@@ -544,7 +547,8 @@ def ensure_parquet_fresh(
         bar = _fetch_day_with_retry(fetch, d, _sleep)
         if bar is None or bar.empty:
             still_missing.append(d)
-            _notify(f"⚠️ {d.isoformat()} 補資料失敗 (retry 3x)")
+            # Same text as _detect_and_fill_gaps so cross-process dedup works.
+            _notify(f"⚠️ {d.isoformat()} 日K缺失，自動補回失敗 — 需手動處理")
             continue
         bar = bar[bar.index.dayofweek < 5]
         bar = bar[~bar.index.normalize().isin(pd.DatetimeIndex(df.index).normalize())]
@@ -567,7 +571,7 @@ def ensure_parquet_fresh(
         df.index.name = "date"
         _atomic_write_parquet(df, parquet_path)
         filled += 1
-        _notify(f"✅ {d.isoformat()} 補資料成功")
+        _notify(f"✅ {d.isoformat()} 日K補回成功")
 
     # Post-write verification — re-read from disk, confirm we reached target.
     verify = _read_parquet_safe(parquet_path)

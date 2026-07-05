@@ -10,10 +10,17 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from src.utils.tw_time import today_taipei
+
 logger = logging.getLogger(__name__)
 
 _BACKUP_DIR = "data"
 _BACKUP_KEEP_DAYS = 7
+
+
+class StateCorruptionError(Exception):
+    """State file unreadable AND no valid backup — trading must not proceed
+    on a default (flat) state while a real position may exist."""
 
 
 @dataclass
@@ -60,24 +67,49 @@ class StateManager:
             equity = self.initial_equity if self.initial_equity is not None else 350_000.0
             return TradingState(equity=equity)
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-            s = raw.get("state", {})
-            return TradingState(
-                position=int(s.get("position", 0)),
-                entry_price=s.get("entry_price"),
-                entry_date=s.get("entry_date"),
-                contracts=int(s.get("contracts", 0)),
-                highest_high=s.get("highest_high"),
-                equity=float(s.get("equity", 350_000.0)),
-                pyramided=bool(s.get("pyramided", False)),
-                pending_action=s.get("pending_action"),
-                pending_contracts=int(s.get("pending_contracts", 0)),
-                pending_signal_date=s.get("pending_signal_date"),
-                pending_reason=s.get("pending_reason"),
-            )
-        except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
-            logger.warning("StateManager.load failed (%s) — returning default state.", exc)
-            return TradingState()
+            return self._parse(self.path)
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as exc:
+            # NEVER silently fall back to a default (flat, 350K) state: with a
+            # real position open that default would let the system buy again
+            # on top of it. Try the daily backups newest-first; if none is
+            # readable, refuse to run.
+            logger.error("StateManager.load failed (%s) — trying backups", exc)
+            for backup in sorted(
+                Path(_BACKUP_DIR).glob(f"{self.path.stem}_backup_*.json"),
+                reverse=True,
+            ):
+                try:
+                    state = self._parse(backup)
+                except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError):
+                    continue
+                logger.error(
+                    "State restored from backup %s — main file was corrupt; "
+                    "verify position against the broker!", backup.name,
+                )
+                self.save(state)  # heal the main file
+                return state
+            raise StateCorruptionError(
+                f"state file {self.path} corrupt ({exc}) and no readable backup "
+                f"in {_BACKUP_DIR}/ — refusing to trade on a default flat state"
+            ) from exc
+
+    @staticmethod
+    def _parse(path: Path) -> TradingState:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        s = raw["state"]  # missing key = corrupt, let it raise
+        return TradingState(
+            position=int(s.get("position", 0)),
+            entry_price=s.get("entry_price"),
+            entry_date=s.get("entry_date"),
+            contracts=int(s.get("contracts", 0)),
+            highest_high=s.get("highest_high"),
+            equity=float(s.get("equity", 350_000.0)),
+            pyramided=bool(s.get("pyramided", False)),
+            pending_action=s.get("pending_action"),
+            pending_contracts=int(s.get("pending_contracts", 0)),
+            pending_signal_date=s.get("pending_signal_date"),
+            pending_reason=s.get("pending_reason"),
+        )
 
     def save(self, state: TradingState) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -100,31 +132,38 @@ class StateManager:
         self._backup_daily()
 
     def _backup_daily(self) -> None:
-        """Copy state to data/state_backup_{date}.json, prune old backups."""
+        """Copy state to data/{stem}_backup_{date}.json, prune old backups.
+
+        The backup name is derived from the state filename so multiple
+        accounts never overwrite each other's backups (the old fixed
+        ``state_backup_{date}.json`` was shared by every account).
+        """
         if not self.path.exists():
             return
         backup_dir = Path(_BACKUP_DIR)
         backup_dir.mkdir(parents=True, exist_ok=True)
-        today_str = date.today().strftime("%Y-%m-%d")
-        backup_path = backup_dir / f"state_backup_{today_str}.json"
+        today_str = today_taipei().strftime("%Y-%m-%d")
+        backup_path = backup_dir / f"{self.path.stem}_backup_{today_str}.json"
         try:
             shutil.copy2(self.path, backup_path)
         except OSError as exc:
             logger.warning("State backup failed: %s", exc)
             return
-        # Prune old backups
-        for old in sorted(backup_dir.glob("state_backup_*.json")):
-            if old == backup_path:
-                continue
-            try:
-                # Extract date from filename
-                date_part = old.stem.replace("state_backup_", "")
-                backup_date = date.fromisoformat(date_part)
-                if (date.today() - backup_date).days > _BACKUP_KEEP_DAYS:
-                    old.unlink()
-                    logger.debug("Pruned old state backup: %s", old.name)
-            except (ValueError, OSError):
-                pass
+        # Prune old backups — both the per-account pattern and the legacy
+        # shared "state_backup_*" name so pre-migration files still age out.
+        prune_globs = {f"{self.path.stem}_backup_*.json", "state_backup_*.json"}
+        for pattern in prune_globs:
+            for old in sorted(backup_dir.glob(pattern)):
+                if old == backup_path:
+                    continue
+                try:
+                    date_part = old.stem.rsplit("_backup_", 1)[-1]
+                    backup_date = date.fromisoformat(date_part)
+                    if (today_taipei() - backup_date).days > _BACKUP_KEEP_DAYS:
+                        old.unlink()
+                        logger.debug("Pruned old state backup: %s", old.name)
+                except (ValueError, OSError):
+                    pass
 
     @staticmethod
     def restore_from_backup(backup_path: str | Path, target_path: str | Path) -> bool:

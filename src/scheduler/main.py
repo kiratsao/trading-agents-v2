@@ -179,43 +179,27 @@ def _build_broker(live: bool):
 
 
 def _build_notifier():
-    """Build LINE push message notifier if env vars present, else no-op."""
-    try:
-        from dotenv import load_dotenv
+    """Shared LINE notifier (deduped) — see src/notify/line.py."""
+    from src.notify.line import build_line_notifier
 
-        load_dotenv()
-    except ImportError:
-        pass
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    user_id = os.environ.get("LINE_USER_ID", "")
-    if not token or not user_id:
-        logger.info("LINE notifier disabled (LINE_CHANNEL_ACCESS_TOKEN / LINE_USER_ID not set)")
-        return lambda msg: None
+    return build_line_notifier()
 
-    def _notify(msg: str) -> None:
-        import json
-        import urllib.request
 
-        payload = {
-            "to": user_id,
-            "messages": [{"type": "text", "text": msg}],
-        }
-        req = urllib.request.Request(
-            "https://api.line.me/v2/bot/message/push",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                logger.info("LINE notified: %s", resp.status)
-        except Exception as exc:
-            logger.warning("LINE notify failed: %s", exc)
+# ---------------------------------------------------------------------------
+# Trading-day guard
+# ---------------------------------------------------------------------------
 
-    return _notify
+
+def _is_tw_trading_day() -> bool:
+    """Cron triggers only know mon-fri; TAIFEX holidays must be skipped here.
+
+    Previously every holiday ran the full 14:25/14:30/15:05 pipeline against
+    yesterday's data — a data-update failure alert plus a decision message
+    identical to the prior trading day's (the duplicate/stale LINE spam)."""
+    from src.data.tw_holidays import is_trading_day
+    from src.utils.tw_time import today_taipei
+
+    return is_trading_day(today_taipei())
 
 
 # ---------------------------------------------------------------------------
@@ -258,20 +242,47 @@ def _query_live_equity(broker) -> tuple[float, str]:
     return 0.0, "估算"
 
 
+_STARTUP_KEY = "daemon-startup"
+_CRASH_LOOP_WINDOW_S = 30 * 60
+
+
 def _send_startup_notification(
     orchestrators: dict, notify_fn, mode: str, broker=None
 ) -> None:
     """Send a single multi-account startup notification.
 
-    One LINE message lists every configured account: product, position, and
-    last close from its product-specific parquet. Per-account live snapshot
-    via Shioaji is deferred to Step 5/6 — the snapshot helper is still
-    MXF-hardcoded.
+    Data hygiene rules (the old version sent stale state.equity and an
+    unlabeled parquet close on every systemd restart — the main source of
+    "重複又過時" LINE messages):
+    - every price/equity is labeled with its date/source, live values from
+      the broker when available;
+    - rapid restarts (crash-loop) collapse into one 🔁 alert instead of a
+      full stale snapshot per restart.
     """
     try:
         from pathlib import Path
 
         import pandas as pd
+
+        from src.notify.line import DedupNotifier
+
+        # Crash-loop suppression: a restart within the window sends one
+        # compact alert (deduped to 1/hour) instead of the full snapshot.
+        if isinstance(notify_fn, DedupNotifier):
+            age = notify_fn.seconds_since(_STARTUP_KEY)
+            notify_fn.record(_STARTUP_KEY)
+            if age is not None and 0 <= age < _CRASH_LOOP_WINDOW_S:
+                notify_fn.send(
+                    f"🔁 daemon 於 {int(age)}s 內重複啟動 — 可能 crash-loop，"
+                    f"請查 journalctl -u trading-agents-v2",
+                    key="crash-loop-alert",
+                    ttl=3600,
+                )
+                logger.warning(
+                    "Startup within %ss of previous start — full snapshot suppressed",
+                    int(age),
+                )
+                return
 
         timings = {o.execution_timing for o in orchestrators.values()}
         if timings == {"night_open"}:
@@ -281,14 +292,20 @@ def _send_startup_notification(
         else:
             schedule_str = "/".join(sorted(timings))
 
+        from src.utils.tw_time import now_taipei
+
         lines = [
             "🚀 trading-agents-v2 啟動",
             "━━━━━━━━━━━━",
+            f"時間: {now_taipei().strftime('%Y-%m-%d %H:%M')} (台北)",
             f"模式: {mode}",
             f"帳戶數: {len(orchestrators)}",
             f"排程: {schedule_str}",
             "━━━━━━━━━━━━",
         ]
+
+        # Live equity once (single Shioaji account backs all orchestrators).
+        live_equity, equity_src = _query_live_equity(broker)
 
         for name, orch in orchestrators.items():
             state = orch.state_mgr.load()
@@ -299,19 +316,22 @@ def _send_startup_notification(
                 else "空倉"
             )
 
-            # Last close from this account's parquet
+            # Last close from this account's parquet — labeled with its date
+            # so a T-1 close can't masquerade as current.
             last_close: float | None = None
+            last_close_date = ""
             try:
                 if Path(orch.data_path).exists():
                     df = pd.read_parquet(orch.data_path)
                     if len(df) > 0:
                         last_close = float(df["close"].iloc[-1])
+                        last_close_date = str(pd.Timestamp(df.index[-1]).date())
             except Exception:
                 pass
 
             lines.append(f"[{name} · {product}]")
             if last_close is not None:
-                lines.append(f"  最新收盤: {last_close:,.2f}")
+                lines.append(f"  最新收盤: {last_close:,.2f} ({last_close_date})")
             lines.append(f"  持倉: {position_str}")
             if state.position > 0 and state.entry_price and last_close is not None:
                 tick_val = orch.strategy.point_value
@@ -319,7 +339,10 @@ def _send_startup_notification(
                 pct = (unrealized / state.equity * 100) if state.equity > 0 else 0.0
                 icon = "🟢" if unrealized >= 0 else "🔴"
                 lines.append(f"  持倉損益: {icon} {unrealized:+,.0f} NTD ({pct:+.1f}%)")
-            lines.append(f"  淨值: {state.equity:,.0f} NTD")
+            if equity_src == "即時" and live_equity > 0:
+                lines.append(f"  淨值: {live_equity:,.0f} NTD (broker 即時)")
+            else:
+                lines.append(f"  淨值: {state.equity:,.0f} NTD (state 快照，可能舊值)")
 
         lines.append("━━━━━━━━━━━━")
         notify_fn("\n".join(lines))
@@ -351,8 +374,17 @@ def main(argv=None) -> None:
     # All orchestrators share one notifier (built once inside _build_orchestrators).
     notify_fn = next(iter(orchestrators.values())).notify_fn
 
-    # ── Startup notification ──────────────────────────────────────────
+    # ── Startup reconcile + notification ─────────────────────────────
+    # Reconcile FIRST so the startup snapshot reflects broker truth — manual
+    # App operations while the daemon was down are absorbed here instead of
+    # requiring the old stop-daemon / hand-edit-JSON / restart SOP.
     startup_broker = _build_broker(is_live)
+    if startup_broker is not None:
+        for name, orch in orchestrators.items():
+            try:
+                orch.reconcile_state_with_broker(startup_broker)
+            except Exception as exc:
+                logger.warning("startup reconcile[%s] failed: %s", name, exc)
     _send_startup_notification(orchestrators, notify_fn, mode, broker=startup_broker)
     if startup_broker:
         startup_broker.logout()
@@ -399,6 +431,28 @@ def main(argv=None) -> None:
                 broker.logout()
         return
 
+    # ── Single-instance lock (daemon mode only) ───────────────────────
+    # Two daemons (e.g. systemd + start_paper.sh nohup) double-fire every
+    # scheduled job and every LINE message. flock is released automatically
+    # when the process dies, so there is no stale-lock failure mode.
+    import fcntl
+
+    lock_path = Path("data/daemon.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "w")  # noqa: SIM115 — held for daemon lifetime
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        msg = "🔴 另一個 scheduler daemon 已在跑（data/daemon.lock 被鎖）— 本 process 退出"
+        logger.error(msg)
+        try:
+            notify_fn(msg)
+        except Exception:
+            pass
+        sys.exit(1)
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+
     # ── Daemon mode (APScheduler) ─────────────────────────────────────
     try:
         from apscheduler.schedulers.blocking import BlockingScheduler  # type: ignore[import]
@@ -413,6 +467,9 @@ def main(argv=None) -> None:
     # Per-product failure is isolated (logged + LINE alert) and does not
     # block the others or the 14:30 signal job.
     def _safe_data_update():
+        if not _is_tw_trading_day():
+            logger.info("非交易日 — 跳過 14:25 資料更新")
+            return
         try:
             from src.data.daily_updater import update_all
 
@@ -441,7 +498,18 @@ def main(argv=None) -> None:
 
     # Each job creates a fresh broker to avoid token expiry, then iterates the
     # accounts whose execution timing matches.
+    def _notify_job_error(job: str, name: str, exc: Exception) -> None:
+        # A silent 14:30/15:05 failure previously left yesterday's pending
+        # or no decision at all with zero user visibility.
+        try:
+            notify_fn(f"🔴 {job}[{name}] 例外: {exc}")
+        except Exception:
+            pass
+
     def _run_signal_all():
+        if not _is_tw_trading_day():
+            logger.info("非交易日 — 跳過 14:30 信號")
+            return
         b = _build_broker(is_live)
         try:
             for name, orch in night_accounts.items():
@@ -449,11 +517,15 @@ def main(argv=None) -> None:
                     orch.run_signal(broker=b)
                 except Exception as exc:
                     logger.exception("run_signal[%s] failed: %s", name, exc)
+                    _notify_job_error("run_signal", name, exc)
         finally:
             if b:
                 b.logout()
 
     def _run_execution_all():
+        if not _is_tw_trading_day():
+            logger.info("非交易日 — 跳過 15:05 執行")
+            return
         b = _build_broker(is_live)
         try:
             for name, orch in night_accounts.items():
@@ -461,11 +533,15 @@ def main(argv=None) -> None:
                     orch.run_execution(broker=b)
                 except Exception as exc:
                     logger.exception("run_execution[%s] failed: %s", name, exc)
+                    _notify_job_error("run_execution", name, exc)
         finally:
             if b:
                 b.logout()
 
     def _run_daily_all():
+        if not _is_tw_trading_day():
+            logger.info("非交易日 — 跳過 14:30 每日執行")
+            return
         b = _build_broker(is_live)
         try:
             for name, orch in next_open_accounts.items():
@@ -473,12 +549,16 @@ def main(argv=None) -> None:
                     orch.run_daily(broker=b)
                 except Exception as exc:
                     logger.exception("run_daily[%s] failed: %s", name, exc)
+                    _notify_job_error("run_daily", name, exc)
         finally:
             if b:
                 b.logout()
 
     # 14:28 connection warm-up (pre-build broker to verify connectivity)
     def _warmup_connection():
+        if not _is_tw_trading_day():
+            logger.info("非交易日 — 跳過 14:28 預熱")
+            return
         logger.info("14:28 連線預熱開始")
         for attempt in range(1, 3):
             try:
@@ -525,6 +605,9 @@ def main(argv=None) -> None:
 
         # 15:10 post-execution verification
         def _post_verify():
+            if not _is_tw_trading_day():
+                logger.info("非交易日 — 跳過 15:10 驗證")
+                return
             try:
                 from scripts.post_execution_verify import run_verify
 
@@ -559,6 +642,9 @@ def main(argv=None) -> None:
 
     # 20:00 pre-settlement check (runs every weekday, skips if not pre-settlement)
     def _pre_settlement_check():
+        if not _is_tw_trading_day():
+            logger.info("非交易日 — 跳過 20:00 結算前檢查")
+            return
         try:
             from scripts.pre_settlement_check import run_check
 
