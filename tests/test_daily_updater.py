@@ -382,6 +382,45 @@ def _seed_parquet_with_hole(path: Path, hole_date: str, *, anchor: str) -> None:
     df.to_parquet(path, index=True)
 
 
+class TestFutureBarGuard:
+    """A future-dated last bar = a night-session (盤後) row written as a day K
+    (real case: 2026-07-06 bar written while today was 07-05). Left alone the
+    updater reports "already up-to-date" forever — it must alert instead."""
+
+    def test_future_last_bar_alerts_and_aborts(self, tmp_path):
+        pq = tmp_path / "test.parquet"
+        _make_existing_parquet(pq, "2026-07-06")  # Monday, after "today"
+        notes = []
+
+        with (
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 7, 5)),
+            patch("src.data.daily_updater._fetch_and_aggregate") as mock_fetch,
+        ):
+            result = update(parquet_path=pq, notify_fn=notes.append)
+
+        assert result["success"] is False
+        assert "在未來" in result["error"]
+        assert any("🔴" in n for n in notes)
+        mock_fetch.assert_not_called()
+
+    def test_last_bar_equal_today_is_not_flagged(self, tmp_path):
+        """last == today is legitimate (14:25 run after today's close)."""
+        pq = tmp_path / "test.parquet"
+        _make_existing_parquet(pq, "2026-07-06")
+
+        with (
+            patch("src.data.daily_updater._today_taipei",
+                  return_value=date(2026, 7, 6)),
+            patch("src.data.daily_updater._detect_and_fill_gaps",
+                  return_value=(0, [])),
+        ):
+            result = update(parquet_path=pq)
+
+        assert result["success"] is True
+        assert result["error"] is None
+
+
 class TestGapDetection:
     """05/18-style intra-window gap detection and back-fill."""
 
