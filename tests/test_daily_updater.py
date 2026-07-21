@@ -56,6 +56,9 @@ class TestTaifexFallback:
         assert out is not None and float(out["close"].iloc[-1]) == 45055.0
 
     def test_shioaji_present_skips_taifex(self):
+        # Healthy path: a present Shioaji bar is used as-is; TAIFEX is only a
+        # fallback/rescue (the latter fires downstream, at the validation ALERT
+        # in update()/ensure_parquet_fresh — see test_updater_taifex_guard).
         d = date(2026, 6, 2)
         with (
             patch("src.data.shioaji_fetcher.fetch_via_env",

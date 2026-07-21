@@ -195,20 +195,27 @@ def update(
         _vclose = float(new_bars["close"].iloc[-1])
         level, vdiffs = validate_fn(_vday, _vclose)
         if level == "alert":
-            detail = "; ".join(str(cd) for cd in vdiffs)
-            msg = (
-                f"🔴 資料驗證失敗: {_vday} close={_vclose:,.0f} 與獨立來源差異過大，"
-                f"不存入 parquet ({detail})"
-            )
-            logger.error(msg)
-            _notify(msg)
-            return {
-                "success": False,
-                "bars_added": 0,
-                "gaps_filled": 0,
-                "latest_date": str(last_date),
-                "error": msg,
-            }
+            # Divergence (usually a Shioaji night/anomalous bar) — don't reject
+            # and leave a gap; substitute the validated TAIFEX 一般 day value.
+            rescued = _rescue_divergent_bar(_vday, new_bars.iloc[[-1]], _notify)
+            if rescued is None:
+                detail = "; ".join(str(cd) for cd in vdiffs)
+                msg = (
+                    f"🔴 資料驗證失敗: {_vday} close={_vclose:,.0f} 與獨立來源差異過大，"
+                    f"且 TAIFEX 無法補，不存入 parquet ({detail})"
+                )
+                logger.error(msg)
+                _notify(msg)
+                return {
+                    "success": False,
+                    "bars_added": 0,
+                    "gaps_filled": 0,
+                    "latest_date": str(last_date),
+                    "error": msg,
+                }
+            for col in ("open", "high", "low", "close", "volume"):
+                if col in rescued.columns:
+                    new_bars.loc[new_bars.index[-1], col] = rescued.iloc[0][col]
         if level == "warn":
             detail = "; ".join(str(cd) for cd in vdiffs)
             wmsg = f"⚠️ 資料驗證: {_vday} close 與來源差異 ({detail})，仍寫入 parquet"
@@ -366,6 +373,61 @@ def _detect_and_fill_gaps(
         notify_fn(f"✅ {d.isoformat()} 日K補回成功")
 
     return filled, still_missing
+
+
+def _taifex_day_bar(day: date) -> pd.DataFrame | None:
+    """Single-day TAIFEX 一般 (day) OHLCV bar, or None — the validated day source
+    used to rescue a divergent Shioaji bar (see ``_rescue_divergent_bar``)."""
+    from src.data.validation import fetch_taifex_day_session_range
+
+    try:
+        tx = fetch_taifex_day_session_range(day, day)
+    except Exception as exc:
+        logger.warning("daily_updater: TAIFEX rescue fetch failed for %s: %s", day, exc)
+        return None
+    if tx is None or tx.empty:
+        return None
+    ts = pd.Timestamp(day)
+    return tx.loc[[ts]] if ts in tx.index else None
+
+
+def _rescue_divergent_bar(
+    day: date,
+    bar: pd.DataFrame,
+    notify_fn: Callable[[str], Any] | None = None,
+) -> pd.DataFrame | None:
+    """On a cross-source validation ALERT, prefer TAIFEX 一般 over the bar.
+
+    Shioaji occasionally hands back a night/anomalous bar (e.g. the 2026-07-17
+    back-fill: 44,714 = overnight vs the real 42,697 day close). Rather than
+    rejecting the whole bar and stalling the parquet with a GAP, substitute the
+    validated TAIFEX day value — the same source the oracle uses.
+
+    Returns the bar to write (TAIFEX's, or the original if it already matches
+    TAIFEX within a point — then the alert was just the flaky Shioaji oracle),
+    or ``None`` when TAIFEX is unavailable and the bar must genuinely be
+    rejected.
+    """
+    tx = _taifex_day_bar(day)
+    if tx is None:
+        return None
+    b_close = float(bar["close"].iloc[-1])
+    t_close = float(tx["close"].iloc[-1])
+    if abs(b_close - t_close) < 1.0:
+        # Bar already equals the validated TAIFEX day value; the alert is the
+        # known-flaky Shioaji oracle diverging — keep the (correct) bar.
+        if notify_fn is not None:
+            notify_fn(
+                f"⚠️ {day} Shioaji oracle 分歧但 bar 已符合 TAIFEX 日盤 "
+                f"{t_close:,.0f}，寫入"
+            )
+        return bar
+    if notify_fn is not None:
+        notify_fn(
+            f"⚠️ {day} bar close={b_close:,.0f} 疑夜盤/異常（與 TAIFEX 一般 "
+            f"{t_close:,.0f} 差 {abs(b_close - t_close):,.0f}pt）— 改用 TAIFEX 日盤值"
+        )
+    return tx
 
 
 def _fetch_and_aggregate(
@@ -576,12 +638,21 @@ def ensure_parquet_fresh(
             vclose = float(bar["close"].iloc[-1])
             level, vdiffs = validate_fn(d, vclose)
             if level == "alert":
-                detail = "; ".join(str(cd) for cd in vdiffs)
-                msg = f"🔴 資料驗證失敗 {d}: close={vclose:,.0f} ({detail}) — 不寫入"
-                logger.error(msg)
-                _notify(msg)
-                still_missing.append(d)
-                continue
+                # Divergence (usually a Shioaji night/anomalous bar) — don't
+                # reject and leave a gap; substitute the validated TAIFEX 一般
+                # day value instead.
+                rescued = _rescue_divergent_bar(d, bar, _notify)
+                if rescued is None:
+                    detail = "; ".join(str(cd) for cd in vdiffs)
+                    msg = (
+                        f"🔴 資料驗證失敗 {d}: close={vclose:,.0f} ({detail}) "
+                        f"且 TAIFEX 無法補 — 不寫入"
+                    )
+                    logger.error(msg)
+                    _notify(msg)
+                    still_missing.append(d)
+                    continue
+                bar = rescued
             if level == "warn":
                 _notify(f"⚠️ 資料驗證 {d}: {'; '.join(str(cd) for cd in vdiffs)}，仍寫入")
         df = pd.concat([df, bar]).sort_index()

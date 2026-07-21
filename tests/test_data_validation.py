@@ -151,7 +151,10 @@ def _seed_parquet(path: Path, last_date: str) -> None:
     df.to_parquet(path, index=True)
 
 
-def test_update_refuses_to_save_on_alert(tmp_path):
+def test_update_refuses_to_save_on_alert_when_taifex_cannot_rescue(tmp_path):
+    # On ALERT the updater first tries to rescue with the validated TAIFEX day
+    # value; only when TAIFEX is unavailable does it refuse (bad bar never
+    # written, gap left for the operator).
     pq = tmp_path / "t.parquet"
     _seed_parquet(pq, "2026-04-07")
     new_bar = pd.DataFrame({"open": [33_300.0], "high": [33_500.0], "low": [33_250.0],
@@ -162,6 +165,7 @@ def test_update_refuses_to_save_on_alert(tmp_path):
         patch("src.data.daily_updater._detect_and_fill_gaps", return_value=(0, [])),
         patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 9)),
         patch("src.data.daily_updater._fetch_and_aggregate", return_value=new_bar),
+        patch("src.data.daily_updater._taifex_day_bar", return_value=None),
     ):
         res = daily_updater.update(
             parquet_path=pq, notify_fn=notes.append,
@@ -172,6 +176,36 @@ def test_update_refuses_to_save_on_alert(tmp_path):
     # parquet must be UNCHANGED (bad bar not written)
     assert len(pd.read_parquet(pq)) == 3
     assert any(m.startswith("🔴") and "不存入" in m for m in notes)
+
+
+def test_update_rescues_with_taifex_day_value_on_alert(tmp_path):
+    # On ALERT with TAIFEX available: substitute the validated TAIFEX 一般 day
+    # value — the divergent (night) bar is never persisted, but no gap is left.
+    pq = tmp_path / "t.parquet"
+    _seed_parquet(pq, "2026-04-07")
+    night = pd.DataFrame({"open": [35_000.0], "high": [35_100.0], "low": [34_900.0],
+                          "close": [35_000.0], "volume": [1]},
+                         index=pd.DatetimeIndex([pd.Timestamp("2026-04-08")], name="date"))
+    taifex_day = pd.DataFrame({"open": [33_000.0], "high": [33_100.0], "low": [32_900.0],
+                               "close": [33_050.0], "volume": [150_000]},
+                              index=pd.DatetimeIndex([pd.Timestamp("2026-04-08")], name="date"))
+    notes: list[str] = []
+    with (
+        patch("src.data.daily_updater._detect_and_fill_gaps", return_value=(0, [])),
+        patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 9)),
+        patch("src.data.daily_updater._fetch_and_aggregate", return_value=night),
+        patch("src.data.daily_updater._taifex_day_bar", return_value=taifex_day),
+    ):
+        res = daily_updater.update(
+            parquet_path=pq, notify_fn=notes.append,
+            validate_fn=lambda day, close: (
+                "alert", [CloseDiff(day, close, 33_050.0, abs(close - 33_050.0), "taifex")]),
+        )
+    assert res["success"] is True and res["bars_added"] == 1
+    out = pd.read_parquet(pq)
+    assert len(out) == 4
+    assert abs(float(out.loc[pd.Timestamp("2026-04-08"), "close"]) - 33_050.0) < 1
+    assert any("改用 TAIFEX" in m for m in notes)
 
 
 def test_update_saves_on_warn(tmp_path):
