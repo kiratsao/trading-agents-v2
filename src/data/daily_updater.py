@@ -194,15 +194,17 @@ def update(
         _vday = new_bars.index[-1].date()
         _vclose = float(new_bars["close"].iloc[-1])
         level, vdiffs = validate_fn(_vday, _vclose)
-        if level == "alert":
-            # Divergence (usually a Shioaji night/anomalous bar) — don't reject
-            # and leave a gap; substitute the validated TAIFEX 一般 day value.
+        if level == "alert" or _spot_flags_bar(_vday, _vclose):
+            # Either the cross-source oracles flagged it, OR the night-proof spot
+            # index says this isn't a day value (a silent night bar the same-
+            # family oracles miss). Resolve the true day close from 3 sources;
+            # write it, or fail loud + reject if nothing is consistent with spot.
             rescued = _rescue_divergent_bar(_vday, new_bars.iloc[[-1]], _notify)
             if rescued is None:
-                detail = "; ".join(str(cd) for cd in vdiffs)
+                detail = "; ".join(str(cd) for cd in vdiffs) or "spot 判定為夜盤/異常"
                 msg = (
-                    f"🔴 資料驗證失敗: {_vday} close={_vclose:,.0f} 與獨立來源差異過大，"
-                    f"且 TAIFEX 無法補，不存入 parquet ({detail})"
+                    f"🔴 資料驗證失敗: {_vday} close={_vclose:,.0f} 無法確定日盤值，"
+                    f"不存入 parquet ({detail})"
                 )
                 logger.error(msg)
                 _notify(msg)
@@ -216,7 +218,7 @@ def update(
             for col in ("open", "high", "low", "close", "volume"):
                 if col in rescued.columns:
                     new_bars.loc[new_bars.index[-1], col] = rescued.iloc[0][col]
-        if level == "warn":
+        elif level == "warn":
             detail = "; ".join(str(cd) for cd in vdiffs)
             wmsg = f"⚠️ 資料驗證: {_vday} close 與來源差異 ({detail})，仍寫入 parquet"
             logger.warning(wmsg)
@@ -391,43 +393,59 @@ def _taifex_day_bar(day: date) -> pd.DataFrame | None:
     return tx.loc[[ts]] if ts in tx.index else None
 
 
+def _spot_flags_bar(day: date, close: float) -> bool:
+    """True when the night-proof spot index (^TWII) says *close* is NOT a day
+    value — a silent night bar the same-family TAIFEX/Shioaji oracles would miss
+    (both can be night at once on a mislabeling parse). Never trusts a parse's
+    session label. Degrades to False (defer to the other oracles) when spot is
+    unavailable, so a yfinance outage never blanket-rejects.
+    """
+    try:
+        from src.data.spot_ref import _BASIS_BAND, fetch_spot_close
+
+        spot = fetch_spot_close(day)
+    except Exception as exc:
+        logger.debug("_spot_flags_bar: spot unavailable for %s (%s)", day, exc)
+        return False
+    return spot is not None and abs(close - spot) > _BASIS_BAND
+
+
 def _rescue_divergent_bar(
     day: date,
     bar: pd.DataFrame,
     notify_fn: Callable[[str], Any] | None = None,
 ) -> pd.DataFrame | None:
-    """On a cross-source validation ALERT, prefer TAIFEX 一般 over the bar.
+    """Resolve the true day close from 3 sources and return the bar to write.
 
-    Shioaji occasionally hands back a night/anomalous bar (e.g. the 2026-07-17
-    back-fill: 44,714 = overnight vs the real 42,697 day close). Rather than
-    rejecting the whole bar and stalling the parquet with a GAP, substitute the
-    validated TAIFEX day value — the same source the oracle uses.
+    On divergence, ``spot_ref.resolve_day_close`` combines the night-proof spot
+    index (^TWII), TAIFEX 一般, and the divergent Shioaji bar — never trusting a
+    parse's session label — and picks the value consistent with spot. This
+    survives a whole environment mislabeling day↔night (the 2026-07 stale-pyc
+    class): if BOTH MXF sources look like night vs spot, it returns ``None`` and
+    the caller fails loud instead of writing a night value or leaving a gap.
 
-    Returns the bar to write (TAIFEX's, or the original if it already matches
-    TAIFEX within a point — then the alert was just the flaky Shioaji oracle),
-    or ``None`` when TAIFEX is unavailable and the bar must genuinely be
-    rejected.
+    Returns the full OHLCV bar of whichever source is the spot-anchored day
+    value, or ``None`` (fail-loud) when nothing is consistent with spot.
     """
+    from src.data.spot_ref import fetch_spot_close, resolve_day_close
+
     tx = _taifex_day_bar(day)
-    if tx is None:
-        return None
-    b_close = float(bar["close"].iloc[-1])
-    t_close = float(tx["close"].iloc[-1])
-    if abs(b_close - t_close) < 1.0:
-        # Bar already equals the validated TAIFEX day value; the alert is the
-        # known-flaky Shioaji oracle diverging — keep the (correct) bar.
+    s_close = float(bar["close"].iloc[-1])
+    t_close = float(tx["close"].iloc[-1]) if tx is not None else None
+    spot = fetch_spot_close(day)
+    val, detail = resolve_day_close(day, taifex=t_close, shioaji=s_close, spot=spot)
+    if val is None:
         if notify_fn is not None:
-            notify_fn(
-                f"⚠️ {day} Shioaji oracle 分歧但 bar 已符合 TAIFEX 日盤 "
-                f"{t_close:,.0f}，寫入"
-            )
-        return bar
+            notify_fn(f"🔴 {day} 無法確定日盤值：{detail} — 不寫入,請人工確認")
+        return None
+    # Return the full bar of whichever source the resolver anchored on.
+    if t_close is not None and abs(val - t_close) <= abs(val - s_close):
+        if notify_fn is not None:
+            notify_fn(f"⚠️ {day} 採 TAIFEX 日盤 {val:,.0f}（{detail}）")
+        return tx
     if notify_fn is not None:
-        notify_fn(
-            f"⚠️ {day} bar close={b_close:,.0f} 疑夜盤/異常（與 TAIFEX 一般 "
-            f"{t_close:,.0f} 差 {abs(b_close - t_close):,.0f}pt）— 改用 TAIFEX 日盤值"
-        )
-    return tx
+        notify_fn(f"⚠️ {day} 採 Shioaji 日盤 {val:,.0f}（{detail}）")
+    return bar
 
 
 def _fetch_and_aggregate(
@@ -637,23 +655,23 @@ def ensure_parquet_fresh(
         if validate_fn is not None:
             vclose = float(bar["close"].iloc[-1])
             level, vdiffs = validate_fn(d, vclose)
-            if level == "alert":
-                # Divergence (usually a Shioaji night/anomalous bar) — don't
-                # reject and leave a gap; substitute the validated TAIFEX 一般
-                # day value instead.
+            if level == "alert" or _spot_flags_bar(d, vclose):
+                # Cross-source oracles flagged it, OR the night-proof spot index
+                # says this isn't a day value. Resolve the true day close from 3
+                # sources; write it, or fail loud + reject if none matches spot.
                 rescued = _rescue_divergent_bar(d, bar, _notify)
                 if rescued is None:
-                    detail = "; ".join(str(cd) for cd in vdiffs)
+                    detail = "; ".join(str(cd) for cd in vdiffs) or "spot 判定為夜盤/異常"
                     msg = (
-                        f"🔴 資料驗證失敗 {d}: close={vclose:,.0f} ({detail}) "
-                        f"且 TAIFEX 無法補 — 不寫入"
+                        f"🔴 資料驗證失敗 {d}: close={vclose:,.0f} 無法確定日盤值 "
+                        f"({detail}) — 不寫入"
                     )
                     logger.error(msg)
                     _notify(msg)
                     still_missing.append(d)
                     continue
                 bar = rescued
-            if level == "warn":
+            elif level == "warn":
                 _notify(f"⚠️ 資料驗證 {d}: {'; '.join(str(cd) for cd in vdiffs)}，仍寫入")
         df = pd.concat([df, bar]).sort_index()
         df.index = pd.to_datetime(df.index)

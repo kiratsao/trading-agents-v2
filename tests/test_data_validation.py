@@ -166,6 +166,8 @@ def test_update_refuses_to_save_on_alert_when_taifex_cannot_rescue(tmp_path):
         patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 9)),
         patch("src.data.daily_updater._fetch_and_aggregate", return_value=new_bar),
         patch("src.data.daily_updater._taifex_day_bar", return_value=None),
+        # spot far from the bar → resolver finds no day-consistent source → reject.
+        patch("src.data.spot_ref.fetch_spot_close", return_value=35_000.0),
     ):
         res = daily_updater.update(
             parquet_path=pq, notify_fn=notes.append,
@@ -195,6 +197,8 @@ def test_update_rescues_with_taifex_day_value_on_alert(tmp_path):
         patch("src.data.daily_updater._today_taipei", return_value=date(2026, 4, 9)),
         patch("src.data.daily_updater._fetch_and_aggregate", return_value=night),
         patch("src.data.daily_updater._taifex_day_bar", return_value=taifex_day),
+        # spot near the TAIFEX day value → resolver anchors on TAIFEX (33,050).
+        patch("src.data.spot_ref.fetch_spot_close", return_value=33_000.0),
     ):
         res = daily_updater.update(
             parquet_path=pq, notify_fn=notes.append,
@@ -205,7 +209,7 @@ def test_update_rescues_with_taifex_day_value_on_alert(tmp_path):
     out = pd.read_parquet(pq)
     assert len(out) == 4
     assert abs(float(out.loc[pd.Timestamp("2026-04-08"), "close"]) - 33_050.0) < 1
-    assert any("改用 TAIFEX" in m for m in notes)
+    assert any("採 TAIFEX" in m for m in notes)
 
 
 def test_update_saves_on_warn(tmp_path):
