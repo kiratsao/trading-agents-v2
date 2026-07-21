@@ -44,10 +44,12 @@ def _build_notifier():
 
 def run_verify(skip_external: bool = False, notify_fn=None) -> dict:
     """Run post-execution verification. Returns dict with results."""
-    from src.state.state_manager import StateManager
+    from src.state.state_manager import StateManager, resolve_state_path
 
     results: list[dict] = []
-    state_mgr = StateManager(path="data/paper_state.json")
+    # Read the daemon's canonical per-account state file, NOT the old orphaned
+    # data/paper_state.json (which the daemon never updated → false "state=20").
+    state_mgr = StateManager(path=str(resolve_state_path()))
     state = state_mgr.load()
 
     # ── 1. 信號→成交一致性 ──

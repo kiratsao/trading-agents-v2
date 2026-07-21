@@ -38,11 +38,14 @@ import csv
 import logging
 from pathlib import Path
 
+from src.state.state_manager import resolve_state_path
+
 logger = logging.getLogger(__name__)
 
 _INVESTORS_YAML = Path("config/investors.yaml")
 _PNL_CSV = Path("data/pnl_history.csv")
-_STATE_JSON = Path("data/paper_state.json")
+# Daemon's canonical state file (single source of truth), not the old orphan.
+_STATE_JSON = resolve_state_path()
 
 
 def load_investors() -> list[dict] | None:

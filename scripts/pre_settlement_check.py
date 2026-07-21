@@ -91,16 +91,18 @@ def run_check(skip_external: bool = False, notify_fn=None) -> dict:
 
     # ── 1. State 完整性 ──
     try:
-        from src.state.state_manager import StateManager
+        from src.state.state_manager import StateManager, resolve_state_path
 
-        state_mgr = StateManager(path="data/paper_state.json")
+        # Daemon's canonical state file (single source of truth), not the orphan.
+        _state_path = resolve_state_path()
+        state_mgr = StateManager(path=str(_state_path))
         state = state_mgr.load()
         state_ok = state.position >= 0 and state.equity > 0
         results.append({
             "name": "State 完整性",
             "passed": state_ok,
             "detail": f"position={state.position}, equity={state.equity:,.0f}",
-            "fix": "檢查 data/paper_state.json 格式",
+            "fix": f"檢查 {_state_path} 格式",
         })
     except Exception as exc:
         state = None
@@ -108,7 +110,7 @@ def run_check(skip_external: bool = False, notify_fn=None) -> dict:
             "name": "State 完整性",
             "passed": False,
             "detail": str(exc),
-            "fix": "檢查 data/paper_state.json 是否存在且格式正確",
+            "fix": "檢查 canonical state 檔是否存在且格式正確",
         })
 
     # ── 2. Ladder 涵蓋 ──
@@ -116,7 +118,7 @@ def run_check(skip_external: bool = False, notify_fn=None) -> dict:
         from src.scheduler.main import _load_config
 
         cfg = _load_config("config/accounts.yaml")
-        acc = cfg["accounts"]["aggressive"]
+        acc = cfg["accounts"]["mxf_aggressive"]
         ladder = acc.get("scale_ladder", [])
         max_eq = max(e["equity"] for e in ladder) if ladder else 0
         equity = state.equity if state else 0

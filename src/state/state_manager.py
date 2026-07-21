@@ -17,6 +17,55 @@ logger = logging.getLogger(__name__)
 _BACKUP_DIR = "data"
 _BACKUP_KEEP_DAYS = 7
 
+# Default account for the single live MXF deployment. Monitoring/verification
+# scripts resolve their state path through resolve_state_path() so they always
+# read the file the daemon actually writes.
+_DEFAULT_ACCOUNT = "mxf_aggressive"
+_DEFAULT_STATE_PATH = f"data/state_{_DEFAULT_ACCOUNT}.json"
+
+
+def resolve_state_path(
+    account: str = _DEFAULT_ACCOUNT,
+    config_path: str = "config/accounts.yaml",
+) -> Path:
+    """Canonical on-disk state path for *account* — the SAME file the daemon writes.
+
+    The daemon (``src/scheduler/main.py``) names each account's state file by
+    convention: ``data/state_{account}.json`` where ``account`` is the
+    accounts.yaml key. Monitoring / verification scripts MUST resolve the path
+    through here instead of hard-coding a literal, so they always read the file
+    the daemon actually maintains.
+
+    (History: the old hard-coded ``data/paper_state.json`` was an orphan the
+    daemon never wrote. Verify jobs compared the *live* broker position against
+    that frozen file and cried wolf — "broker=0, state=20" — every day.)
+
+    The config is consulted only to fail loudly if *account* was renamed or
+    removed; the path itself follows the daemon's naming convention. A missing
+    or unreadable config degrades to the convention path with a warning so a
+    monitoring run never hard-crashes on a partial deployment.
+    """
+    path = Path(f"data/state_{account}.json")
+    try:
+        import yaml
+
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as exc:  # missing/unreadable config → degrade, don't crash
+        logger.warning(
+            "resolve_state_path: cannot read %s (%s) — using convention path %s",
+            config_path, exc, path,
+        )
+        return path
+    accounts = cfg.get("accounts", {})
+    if account not in accounts:
+        available = ", ".join(sorted(accounts)) or "(none)"
+        raise KeyError(
+            f"resolve_state_path: account '{account}' not in {config_path} "
+            f"(available: {available})"
+        )
+    return path
+
 
 class StateCorruptionError(Exception):
     """State file unreadable AND no valid backup — trading must not proceed
@@ -55,7 +104,7 @@ class StateManager:
 
     def __init__(
         self,
-        path: str = "data/paper_state.json",
+        path: str = _DEFAULT_STATE_PATH,
         initial_equity: float | None = None,
     ) -> None:
         self.path = Path(path)

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pandas as pd
 
+from src.state.state_manager import resolve_state_path
 from src.utils.freshness import check_parquet_freshness
 
 try:
@@ -31,7 +32,9 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 _DATA = Path("data/MXF_Daily_Clean_2020_to_now.parquet")
-_STATE = Path("data/paper_state.json")
+# Daemon's canonical per-account state file (single source of truth via
+# accounts.yaml), NOT the old orphaned data/paper_state.json.
+_STATE = resolve_state_path()
 
 # Parquet freshness now lives in src.utils.freshness (single source of truth).
 
@@ -44,9 +47,14 @@ def _send_line(msg: str) -> None:
 
 
 def _refresh_state_equity_from_broker() -> str:
-    """08:00 hook: read live equity from Shioaji and cache it into
-    ``data/paper_state.json`` so downstream consumers (sizing, the
+    """08:00 hook: read live equity from Shioaji and cache it into the daemon's
+    canonical state file (``_STATE``) so downstream consumers (sizing, the
     health-check report below) don't drift on stale values.
+
+    This writes ONLY ``state.equity`` (position/contracts are preserved from the
+    loaded state) — the same operation the daemon's own ``_persist_live_equity``
+    performs. At 08:00 the daemon is idle (signal runs 14:30), so there is no
+    write race on the canonical file.
 
     No-ops cleanly when credentials / network are unavailable; the
     existing cached value is preserved on every failure mode.
