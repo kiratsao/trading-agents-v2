@@ -81,6 +81,12 @@ def fetch_day_session_bar(
         "low": float(sess["low"].min()),
         "close": float(sess.iloc[-1]["close"]),
         "volume": int(sess["volume"].sum()),
+        # Completeness metadata (2026-07-28 lesson: the feed died at 09:0x and
+        # the truncated last bar masqueraded as the day close, 43,175 vs the
+        # real 41,608 — a HOLD instead of a stop-out). Callers on the LIVE
+        # path must check last_ts before treating close as the session close.
+        "last_ts": sess.iloc[-1]["ts"].isoformat(),
+        "n_bars": int(len(sess)),
     }
     if bar["volume"] < volume_warn:
         logger.warning(
@@ -105,7 +111,8 @@ def fetch_day_session_bars(api, contract, start: date, end: date) -> pd.DataFram
         if is_trading_day(d):
             bar = fetch_day_session_bar(api, contract, d)
             if bar is not None:
-                rows.append(bar)
+                # Strip metadata keys — the parquet schema stays OHLCV only.
+                rows.append({k: bar[k] for k in ("open", "high", "low", "close", "volume")})
                 idx.append(pd.Timestamp(d))
         d += timedelta(days=1)
 

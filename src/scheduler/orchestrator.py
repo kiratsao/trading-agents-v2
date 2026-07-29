@@ -21,7 +21,7 @@ import pandas as pd
 from src.signals.fetcher import fetch_prices
 from src.signals.tsmc_tracker import TsmcSignal, compute_signal
 from src.state.state_manager import StateManager, TradingState
-from src.strategy.v2b_engine import V2bEngine
+from src.strategy.v2b_engine import Signal, V2bEngine
 from src.utils.tw_time import now_taipei, today_taipei
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,16 @@ _REAL_DATA_FALLBACKS = [
     Path.home() / "trading-agents-v2" / "data" / "MXF_Daily_Clean_2020_to_now.parquet",
 ]
 _TAIEX_WEIGHT_LEVEL = 22_000
+
+# ── Live today-bar validation (2026-07-28 incident) ─────────────────────────
+# A truncated kbars feed (last bar 09:0x) reported close=43,175 vs the real
+# 41,608 day close; 43,175 > trailing stop 42,673 → silent HOLD instead of a
+# stop-out. Every live decision bar must now pass (a) kbar completeness and
+# (b) the night-proof spot gate before it may be treated as the day close.
+_PROXY_AMBIG_BUFFER = 150.0  # pts — |proxy − stop| below this = ambiguous → human
+_BASIS_MIN_PAIRS = 5         # min (fut close − spot) samples to trust the basis
+_BASIS_LOOKBACK_BARS = 25    # parquet bars scanned for the rolling basis
+_EQUITY_SANITY_PTS = 600.0   # implied-mark deviation beyond this = stale margin
 
 
 class V2bOrchestrator:
@@ -198,6 +208,10 @@ class V2bOrchestrator:
             tsmc_signal=tsmc_signal,
         )
 
+        # Live today-bar policy (entry fail-closed / exit fail-safe) — same
+        # rule as run_signal so same_day_close mode is equally protected.
+        sig, _bar_lines = self._apply_today_bar_policy(sig, state, df, display_ind)
+
         result: dict = {
             "action": sig.action,
             "contracts": sig.contracts,
@@ -229,6 +243,7 @@ class V2bOrchestrator:
                 state.entry_price = exec_price
                 state.contracts = filled_n
                 state.highest_high = exec_price
+                state.entry_date = today_taipei().isoformat()
                 result["entry_price"] = exec_price
                 _action_contracts = filled_n
             else:
@@ -260,6 +275,7 @@ class V2bOrchestrator:
                     state.contracts = 0
                     state.highest_high = None
                     state.pyramided = False
+                    state.entry_date = None
                     sell_ok = False
                     already_flat = True
                     result["already_flat"] = True
@@ -304,6 +320,7 @@ class V2bOrchestrator:
                 state.contracts = 0
                 state.highest_high = None
                 state.pyramided = False
+                state.entry_date = None
 
             # Settlement rollover: re-check entry immediately
             # Only proceed if sell was successful
@@ -349,6 +366,7 @@ class V2bOrchestrator:
                                 state.entry_price = buy_price
                                 state.contracts = filled_n
                                 state.highest_high = buy_price
+                                state.entry_date = today_taipei().isoformat()
                                 _action_contracts = filled_n
                                 result["rollover"] = True
                                 result["rollover_contracts"] = filled_n
@@ -368,6 +386,7 @@ class V2bOrchestrator:
                         state.entry_price = buy_price
                         state.contracts = buy_n
                         state.highest_high = buy_price
+                        state.entry_date = today_taipei().isoformat()
                         _action_contracts = buy_n
                         result["rollover"] = True
                         result["rollover_contracts"] = buy_n
@@ -446,6 +465,7 @@ class V2bOrchestrator:
             equity_src=equity_src,
             tsmc_signal=tsmc_signal,
             data_date=df.index[-1].date(),
+            bar_meta=getattr(self, "today_bar_meta", None),
         )
         self.notify_fn(msg)
         return result
@@ -485,8 +505,15 @@ class V2bOrchestrator:
             self.reconcile_state_with_broker(broker)
 
         state = self.state_mgr.load()
+        # Capture the previous persisted equity BEFORE the live refresh — the
+        # staleness check needs it as its baseline.
+        prev_equity = float(state.equity or 0.0)
         # Cache the latest live equity into state when broker can serve it.
         equity, equity_src = _persist_live_equity(broker, state, self.state_mgr)
+        # Plausibility-check the margin read (stale-mark guard, 7/28 follow-up).
+        equity, _equity_note = self._sanity_check_equity(
+            equity, equity_src, prev_equity, state, df,
+        )
 
         # Advance the trailing high-water mark from today's close BEFORE the
         # signal is computed. Backtest trails on close (backtest/engine.py:258);
@@ -511,6 +538,12 @@ class V2bOrchestrator:
             tsmc_signal=tsmc_signal,
         )
 
+        # Live today-bar policy: entry fail-closed / exit fail-safe on an
+        # unvalidated bar. May override sig (cancel buy/add, or force close
+        # via the spot+basis proxy) — the pending intent below stores the
+        # POST-policy signal so 15:05 executes the safe action.
+        sig, _bar_lines = self._apply_today_bar_policy(sig, state, df, display_ind)
+
         # Save pending intent
         today_str = now_taipei().strftime("%Y-%m-%d")
         state.pending_action = sig.action
@@ -533,6 +566,7 @@ class V2bOrchestrator:
             target_position=state.position + sig.contracts if sig.action == "add" else None,
             data_date=last_bar_date,
             data_stale=data_stale,
+            bar_meta=getattr(self, "today_bar_meta", None),
         )
         self.notify_fn(msg)
 
@@ -664,6 +698,7 @@ class V2bOrchestrator:
                 state.entry_price = exec_price
                 state.contracts = filled_n
                 state.highest_high = exec_price
+                state.entry_date = today_taipei().isoformat()
             else:
                 msg = (
                     f"🔴 進場未成交: Buy {state.pending_contracts}口 IOC 未成交，維持空倉"
@@ -695,6 +730,7 @@ class V2bOrchestrator:
                     state.contracts = 0
                     state.highest_high = None
                     state.pyramided = False
+                    state.entry_date = None
                     state.pending_action = None
                     state.pending_signal_date = None
                     state.pending_contracts = 0
@@ -741,6 +777,7 @@ class V2bOrchestrator:
                 state.contracts = 0
                 state.highest_high = None
                 state.pyramided = False
+                state.entry_date = None
 
             # ── Settlement rollover: re-check entry immediately ───
             # Only proceed if sell was successful (not rejected by exchange)
@@ -790,6 +827,7 @@ class V2bOrchestrator:
                                     state.entry_price = buy_price
                                     state.contracts = filled_n
                                     state.highest_high = buy_price
+                                    state.entry_date = today_taipei().isoformat()
                                     result["rollover"] = True
                                     result["rollover_contracts"] = filled_n
                                     result["rollover_price"] = buy_price
@@ -809,6 +847,7 @@ class V2bOrchestrator:
                             state.entry_price = buy_price
                             state.contracts = buy_n
                             state.highest_high = buy_price
+                            state.entry_date = today_taipei().isoformat()
                             result["rollover"] = True
                             result["rollover_contracts"] = buy_n
                             result["rollover_price"] = buy_price
@@ -938,6 +977,160 @@ class V2bOrchestrator:
             )
         return True
 
+    def _apply_today_bar_policy(
+        self, sig, state: TradingState, df: pd.DataFrame, indicators: dict,
+    ):
+        """Asymmetric fail-mode policy for an unvalidated live today-bar.
+
+        * Entry fail-CLOSED — never open/scale a position on an unvalidated
+          bar: buy/add is cancelled with a 🔴 alert.
+        * Exit fail-SAFE — never silently HOLD through a stop: when the bar
+          was unusable the trailing stop is evaluated on a spot+median-basis
+          proxy; a clear break SELLs as normal, ambiguity/no-spot alerts 🔴
+          for the human (2026-07-28: the truncated 43,175 held straight
+          through the 42,673 stop while the market closed at 41,608).
+
+        Returns (possibly-overridden sig, extra LINE lines). No-op when not
+        live, when the meta seam is absent (tests patch _load_data), when
+        today isn't a trading day, or when the bar is fully validated.
+        """
+        meta = getattr(self, "today_bar_meta", None)
+        if not self.live or meta is None:
+            return sig, []
+        from src.utils.freshness import is_trading_day
+
+        today = today_taipei()
+        if not is_trading_day(today):
+            return sig, []
+        lines = [f"Bar來源: {meta.get('desc', '?')}"]
+        if meta.get("validated"):
+            return sig, lines
+
+        if sig.action in ("buy", "add"):
+            reason = (
+                f"🔒 fail-closed: {sig.action} {sig.contracts}口 取消 — "
+                f"當日bar未驗證 ({meta.get('reject')})"
+            )
+            self.notify_fn(f"🔴 進場封鎖(fail-closed): {reason}")
+            logger.error(reason)
+            return Signal("hold", 0, reason), lines
+
+        if state.position > 0 and not meta.get("usable_for_exit"):
+            verdict, detail = self._proxy_exit_check(df, state, indicators)
+            lines.append(f"Proxy評估: {detail}")
+            if verdict == "sell":
+                reason = f"proxy trailing stop: {detail} (bar未驗證,以spot+basis代理評估)"
+                logger.warning("today-bar policy: forcing close — %s", reason)
+                return Signal("close", state.contracts or state.position, reason), lines
+            if verdict == "hold":
+                self.notify_fn(
+                    f"⚠️ {today} 當日bar未驗證({meta.get('reject')})，"
+                    f"proxy 未跌穿 stop（{detail}）— 維持持倉"
+                )
+            else:  # ambiguous
+                self.notify_fn(
+                    f"🔴 {today} 當日bar未驗證({meta.get('reject')}) 且 trailing "
+                    f"未能評估（{detail}）— 需人工確認持倉！"
+                )
+        return sig, lines
+
+    def _proxy_exit_check(
+        self, df: pd.DataFrame, state: TradingState, indicators: dict,
+    ) -> tuple[str, str]:
+        """Evaluate the trailing stop via spot + rolling median basis.
+
+        Returns (verdict, detail): verdict ∈ {"sell", "hold", "ambiguous"}.
+        proxy_close = today's ^TWII spot + median(fut_close − spot) over the
+        recent parquet bars. A break beyond ±_PROXY_AMBIG_BUFFER of the stop
+        is decisive; inside the band (or missing inputs) → ambiguous → human.
+        """
+        import statistics
+
+        try:
+            from src.data.spot_ref import fetch_spot_close, fetch_spot_range
+
+            spot_today = fetch_spot_close(today_taipei())
+        except Exception as exc:
+            return "ambiguous", f"spot(^TWII) 取得失敗: {exc}"
+        if spot_today is None:
+            return "ambiguous", "spot(^TWII) 不可得"
+
+        tail = df.tail(_BASIS_LOOKBACK_BARS)
+        try:
+            spots = fetch_spot_range(tail.index[0].date(), tail.index[-1].date())
+        except Exception:
+            spots = {}
+        pairs = [
+            float(tail.loc[ts, "close"]) - spots[ts.date()]
+            for ts in tail.index if ts.date() in spots
+        ]
+        if len(pairs) < _BASIS_MIN_PAIRS:
+            return "ambiguous", f"basis 樣本不足 ({len(pairs)}<{_BASIS_MIN_PAIRS})"
+        basis = statistics.median(pairs)
+        proxy = spot_today + basis
+
+        atr = indicators.get("atr") or 0.0
+        if atr <= 0:
+            try:
+                atr = float(self.strategy._compute_indicators(df).iloc[-1]["atr"])
+            except Exception:
+                atr = 0.0
+        hh = state.highest_high or state.entry_price
+        if hh is None or atr <= 0:
+            return "ambiguous", f"無 highest_high/ATR (hh={hh}, atr={atr:.0f})"
+        stop = hh - self.strategy.trail_atr_mult * atr
+
+        detail = (
+            f"proxy={proxy:,.0f} (spot {spot_today:,.0f} + basis {basis:+,.0f}) "
+            f"vs stop {stop:,.0f}"
+        )
+        if proxy < stop - _PROXY_AMBIG_BUFFER:
+            return "sell", detail + " → 明確跌穿"
+        if proxy > stop + _PROXY_AMBIG_BUFFER:
+            return "hold", detail + " → 明確在上"
+        return "ambiguous", detail + f" → 差距 < {_PROXY_AMBIG_BUFFER:.0f}pt"
+
+    def _sanity_check_equity(
+        self,
+        equity: float,
+        equity_src: str,
+        prev_equity: float,
+        state: TradingState,
+        df: pd.DataFrame,
+    ) -> tuple[float, str | None]:
+        """Plausibility-check the broker margin equity read (7/28 follow-up).
+
+        With a position on and a VALIDATED today close, the equity move since
+        the last persisted read should roughly equal Δclose × contracts × 50.
+        An implied-mark deviation beyond _EQUITY_SANITY_PTS points flags a
+        stale margin read; sizing then uses the conservative (lower) value.
+        Approximation note: prev_equity embeds the previous session's mark,
+        so the 600pt tolerance absorbs normal overnight/basis noise.
+        """
+        meta = getattr(self, "today_bar_meta", None)
+        tick = 50.0
+        if (
+            not self.live or equity_src != "即時" or state.position <= 0
+            or state.contracts <= 0 or prev_equity <= 0
+            or meta is None or not meta.get("validated") or len(df) < 2
+        ):
+            return equity, None
+        today_close = float(df["close"].iloc[-1])
+        prev_close = float(df["close"].iloc[-2])
+        expected = prev_equity + (today_close - prev_close) * state.contracts * tick
+        dev_pts = (equity - expected) / (state.contracts * tick)
+        if abs(dev_pts) <= _EQUITY_SANITY_PTS:
+            return equity, None
+        conservative = min(equity, expected)
+        note = (
+            f"⚠️ margin equity 疑 stale: broker={equity:,.0f} vs "
+            f"估算={expected:,.0f}（隱含 mark 偏離 {dev_pts:+.0f}pt）— "
+            f"sizing 改用保守值 {conservative:,.0f}"
+        )
+        logger.warning(note)
+        self.notify_fn(note)
+        return conservative, note
+
     def _check_data_freshness(self) -> tuple[bool, str]:
         """Delegate to the single source of truth (src.utils.freshness).
 
@@ -1000,6 +1193,7 @@ class V2bOrchestrator:
         target_position: int | None = None,
         data_date=None,
         data_stale: bool = False,
+        bar_meta: dict | None = None,
     ) -> str:
         """Build the rich LINE decision notification."""
         action = sig.action
@@ -1052,8 +1246,13 @@ class V2bOrchestrator:
             )
 
         # Label the close with its bar date so a stale close is visibly stale
-        # instead of masquerading as today's.
-        close_line = f"台指收盤: {close:,.0f}"
+        # instead of masquerading as today's. The 「台指收盤」 label is reserved
+        # for a VALIDATED day-session close — an unvalidated value is shown as
+        # 參考價 so a wrong bar can never masquerade as the official close.
+        if bar_meta is not None and not bar_meta.get("validated"):
+            close_line = f"參考價(未驗證): {close:,.0f}"
+        else:
+            close_line = f"台指收盤: {close:,.0f}"
         if data_date is not None:
             close_line += f" ({data_date})"
 
@@ -1067,6 +1266,8 @@ class V2bOrchestrator:
             f"動作: {action_line}",
             close_line,
         ]
+        if bar_meta is not None:
+            lines.append(f"Bar來源: {bar_meta.get('desc', '?')}")
         if pnl_line:
             lines.append(pnl_line)
         lines += [
@@ -1143,40 +1344,145 @@ class V2bOrchestrator:
         # multiple rapid connections that cause segfaults in the Shioaji C extension).
         # Pass broker so we reuse the existing connection instead of creating a second one.
         today_bar = _fetch_today_bar_shioaji(simulation=False, broker=broker) if self.live else None
+        meta = today_bar.pop("_meta", None) if isinstance(today_bar, dict) else None
         if today_bar is not None:
             today_ts = pd.Timestamp(today_bar["date"])
             if today_ts not in df.index:
-                row = pd.DataFrame(
-                    [
-                        {
-                            "open": today_bar["open"],
-                            "high": today_bar["high"],
-                            "low": today_bar["low"],
-                            "close": today_bar["close"],
-                            "volume": today_bar.get("volume", 0),
-                        }
-                    ],
-                    index=[today_ts],
-                )
-                df = pd.concat([df, row])
-                df = df.sort_index()
-                logger.info(
-                    "_load_data: appended today's bar from Shioaji  date=%s  close=%.0f",
-                    today_ts.date(),
-                    today_bar["close"],
-                )
+                # An INVALID bar (truncated feed / spot-gate failure) must never
+                # enter the decision df — a wrong close silently defeats the
+                # trailing stop (2026-07-28: 43,175 vs real 41,608 → HOLD).
+                # meta None = legacy caller/test seam → keep old behavior.
+                if meta is None or meta.get("usable_for_exit"):
+                    row = pd.DataFrame(
+                        [
+                            {
+                                "open": today_bar["open"],
+                                "high": today_bar["high"],
+                                "low": today_bar["low"],
+                                "close": today_bar["close"],
+                                "volume": today_bar.get("volume", 0),
+                            }
+                        ],
+                        index=[today_ts],
+                    )
+                    df = pd.concat([df, row])
+                    df = df.sort_index()
+                    logger.info(
+                        "_load_data: appended today's bar  date=%s  close=%.0f  (%s)",
+                        today_ts.date(), today_bar["close"],
+                        meta["desc"] if meta else "legacy",
+                    )
+                else:
+                    logger.error(
+                        "_load_data: today's bar REJECTED — %s  close=%.0f  (%s)",
+                        meta.get("reject"), today_bar["close"], meta.get("desc"),
+                    )
             else:
+                # Bar already persisted by the (validated) updater path.
+                meta = {
+                    "source": "parquet", "validated": True, "usable_for_exit": True,
+                    "reject": None, "desc": "parquet已含今日bar ✅",
+                    "last_kbar": None, "spot_dev": None,
+                }
                 logger.info(
                     "_load_data: Shioaji bar already in parquet  date=%s",
                     today_ts.date(),
                 )
         else:
+            if self.live:
+                meta = {
+                    "source": None, "validated": False, "usable_for_exit": False,
+                    "reject": "無今日bar(Shioaji不可用)", "desc": "無今日bar 🔴",
+                    "last_kbar": None, "spot_dev": None,
+                }
             logger.info(
                 "_load_data: Shioaji unavailable — using parquet only  latest=%s",
                 df.index[-1].date() if len(df) > 0 else "N/A",
             )
 
+        # Live decision paths read this to apply the fail-closed / fail-safe
+        # policy; None = non-live or legacy (patched) seam → policy skipped.
+        self.today_bar_meta = meta if self.live else None
         return df
+
+
+def _validate_today_bar(bar: dict, today, source: str) -> dict:
+    """Dual validation of a live today-bar (kbars AND snapshot paths).
+
+    (a) Completeness — kbars only: the LAST session kbar must fall in
+        13:40–13:45 (settlement day: 13:25–13:30). A feed that died mid-morning
+        yields a truncated "close" that must never be treated as the day close.
+    (b) Spot gate — both paths: |close − ^TWII spot| ≤ _BASIS_BAND (the spot
+        index has no night session, so it is night-proof truth).
+
+    Returns a meta dict:
+      validated       — passed BOTH checks → may be labeled 台指收盤, entries OK
+      usable_for_exit — good enough to evaluate exits on (validated; or complete
+                        kbars with spot unavailable; or snapshot passing spot)
+      reject / desc   — human-readable status for alerts and the LINE message
+    """
+    from datetime import time as _dtime
+
+    from src.strategy.v2b_engine import _is_settlement_day
+
+    close = float(bar["close"])
+    last_kbar = None
+    complete = False
+    if source == "kbars":
+        try:
+            ts = pd.Timestamp(bar.get("last_ts"))
+            last_kbar = ts.strftime("%H:%M")
+            t = ts.time()
+            if _is_settlement_day(pd.Timestamp(today)):
+                complete = _dtime(13, 25) <= t < _dtime(13, 30)
+            else:
+                complete = _dtime(13, 40) <= t < _dtime(13, 45)
+        except (TypeError, ValueError):
+            complete = False
+
+    spot = spot_dev = None
+    spot_ok: bool | None = None
+    try:
+        from src.data.spot_ref import _BASIS_BAND, fetch_spot_close
+
+        spot = fetch_spot_close(today)
+        if spot is not None:
+            spot_dev = close - spot
+            spot_ok = abs(spot_dev) <= _BASIS_BAND
+    except Exception as exc:
+        logger.warning("_validate_today_bar: spot gate unavailable (%s)", exc)
+
+    validated = bool(complete and spot_ok)
+    usable_for_exit = (
+        validated
+        or (complete and spot_ok is None)
+        or (source == "snapshot" and spot_ok is True)
+    )
+
+    reject = None
+    if not validated:
+        parts = []
+        if source == "kbars" and not complete:
+            parts.append(f"kbars截斷(末根 {last_kbar or '?'})")
+        if source == "snapshot":
+            parts.append("snapshot非日盤kbar")
+        if spot_ok is False:
+            parts.append(f"spot偏離 {spot_dev:+.0f}pt")
+        elif spot_ok is None:
+            parts.append("spot不可得")
+        reject = "、".join(parts) or "未驗證"
+
+    spot_str = f"spot誤差{spot_dev:+.0f}pt" if spot_dev is not None else "spot n/a"
+    icon = "✅" if validated else ("⚠️" if usable_for_exit else "🔴")
+    desc = f"{source}(末根 {last_kbar}) {spot_str} {icon}" if source == "kbars" else \
+           f"{source} {spot_str} {icon}"
+
+    return {
+        "source": source, "last_kbar": last_kbar, "complete": complete,
+        "spot": spot, "spot_dev": spot_dev, "spot_ok": spot_ok,
+        "validated": validated, "usable_for_exit": usable_for_exit,
+        "reject": reject, "desc": desc,
+    }
 
 
 def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | None:
@@ -1227,10 +1533,14 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
         contract = broker.get_contract("MXF")
         bar = fetch_day_session_bar(broker._api, contract, today)
         if bar is not None:
-            logger.info("_fetch_today_bar_shioaji: kbars OK  close=%.0f", bar["close"])
+            meta = _validate_today_bar(bar, today, source="kbars")
+            logger.info(
+                "_fetch_today_bar_shioaji: kbars close=%.0f  %s",
+                bar["close"], meta["desc"],
+            )
             if owns_adapter:
                 broker.logout()
-            return {"date": str(today), **bar}
+            return {"date": str(today), **bar, "_meta": meta}
         logger.debug("_fetch_today_bar_shioaji: no day-session bar for %s", today)
     except Exception as exc:
         logger.warning("_fetch_today_bar_shioaji: kbars failed: %s — trying snapshot", exc)
@@ -1253,6 +1563,7 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
             "volume": int(snap.get("total_volume", 0)),
             "_source": "snapshot",  # flag for callers to detect fallback
         }
+        result["_meta"] = _validate_today_bar(result, today, source="snapshot")
         if owns_adapter:
             broker.logout()
         return result
