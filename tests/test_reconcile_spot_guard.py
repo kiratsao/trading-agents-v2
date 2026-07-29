@@ -40,6 +40,7 @@ def test_spot_guard_corrects_skips_and_adds(tmp_path, monkeypatch):
 
     monkeypatch.setattr(rc, "fetch_taifex_day_session_range", lambda s, e: taifex)
     monkeypatch.setattr(rc, "_fetch_spot", lambda s, e: spot)
+    monkeypatch.setattr(rc, "_fetch_nights", lambda s, e: {})  # provenance ambiguous
 
     rc.reconcile(pq, date(2026, 7, 15), date(2026, 7, 20), apply=True)
     out = pd.read_parquet(pq)
@@ -52,6 +53,62 @@ def test_spot_guard_corrects_skips_and_adds(tmp_path, monkeypatch):
     assert d_add in out.index and abs(float(out.loc[d_add, "close"]) - 42_697.0) < 1
     # ADD far from spot (looks like night/anomaly) -> refused
     assert d_add_bad not in out.index
+
+
+def test_provenance_night_corrects_despite_spot_preferring_it(tmp_path, monkeypatch):
+    """THE 2026-07-22 regression: stored 44,957 == 盤後 (night) bit-exactly,
+    yet night sits CLOSER to spot (|131|) than the day value (|199|) because
+    the day/night gap (330pt) is below basis noise. Provenance must outrank
+    the spot distance → CORRECT to the day value 44,627."""
+    d = pd.Timestamp("2026-07-22")
+    seed = pd.DataFrame(
+        {"open": [44_571.0], "high": [44_995.0], "low": [44_415.0],
+         "close": [44_957.0], "volume": [1]},
+        index=pd.DatetimeIndex([d], name="date"),
+    )
+    pq = tmp_path / "MXF.parquet"
+    seed.to_parquet(pq)
+
+    taifex = pd.DataFrame(
+        [{"open": 45_039.0, "high": 45_365.0, "low": 44_615.0,
+          "close": 44_627.0, "volume": 144_978}],
+        index=pd.DatetimeIndex([d], name="date"),
+    )
+    monkeypatch.setattr(rc, "fetch_taifex_day_session_range", lambda s, e: taifex)
+    monkeypatch.setattr(rc, "_fetch_spot", lambda s, e: {d: 44_826.0})
+    monkeypatch.setattr(rc, "_fetch_nights", lambda s, e: {d: 44_957.0})
+
+    rc.reconcile(pq, date(2026, 7, 22), date(2026, 7, 22), apply=True)
+    out = pd.read_parquet(pq)
+    assert abs(float(out.loc[d, "close"]) - 44_627.0) < 1  # night → day, spot overruled
+
+
+def test_anomaly_not_matching_any_candidate_still_skips(tmp_path, monkeypatch):
+    """stored matches NEITHER 一般 nor 盤後 (provenance ambiguous) and sits
+    closer to spot than the re-fetched value → the 7/07–7/15 protection must
+    still SKIP (never overwrite correct history with an unverified re-fetch)."""
+    d = pd.Timestamp("2026-07-22")
+    seed = pd.DataFrame(
+        {"open": [44_800.0], "high": [44_900.0], "low": [44_700.0],
+         "close": [44_800.0], "volume": [1]},   # ≠ 44,627 (day), ≠ 44,957 (night)
+        index=pd.DatetimeIndex([d], name="date"),
+    )
+    pq = tmp_path / "MXF.parquet"
+    seed.to_parquet(pq)
+
+    taifex = pd.DataFrame(
+        [{"open": 45_039.0, "high": 45_365.0, "low": 44_615.0,
+          "close": 44_627.0, "volume": 144_978}],
+        index=pd.DatetimeIndex([d], name="date"),
+    )
+    # spot 44,826: stored |26| < re-fetch |199| → protected
+    monkeypatch.setattr(rc, "fetch_taifex_day_session_range", lambda s, e: taifex)
+    monkeypatch.setattr(rc, "_fetch_spot", lambda s, e: {d: 44_826.0})
+    monkeypatch.setattr(rc, "_fetch_nights", lambda s, e: {d: 44_957.0})
+
+    rc.reconcile(pq, date(2026, 7, 22), date(2026, 7, 22), apply=True)
+    out = pd.read_parquet(pq)
+    assert abs(float(out.loc[d, "close"]) - 44_800.0) < 1  # untouched
 
 
 def test_spot_guard_aborts_without_spot(tmp_path, monkeypatch):

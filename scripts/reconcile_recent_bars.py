@@ -1,12 +1,15 @@
 """Reconcile a NARROW, explicit window of the MXF day-K parquet against TAIFEX
-一般 (day) — spot-guarded so it can never overwrite a correct value with a worse
-one.
+一般 (day) — provenance-first, then spot-guarded.
 
-Every candidate change is gated on the TWSE spot index (^TWII, day session):
-  * ADD (missing day)  — apply only if |TAIFEX一般 − spot| ≤ SPOT_ADD_TOL, else
-    SKIP (the re-fetched TAIFEX value looks like a night/anomaly, not the day).
-  * CORRECT (present, differs) — apply only if the new value is STRICTLY closer
-    to spot than the existing one, else SKIP.
+Decision order for a present-but-different bar:
+  1. PROVENANCE — stored close == TAIFEX 盤後 (night) value (±PROV_TOL) →
+     CORRECT to the day value, no spot consulted. Identity evidence beats a
+     distance judgment (2026-07-22: the night value sat CLOSER to spot than
+     the day value because the day/night gap was below basis noise).
+  2. SPOT tiebreaker — stored matches no candidate: CORRECT only if the new
+     value is STRICTLY closer to spot, else SKIP (protects correct history
+     from unverified re-fetches — the 7/07–7/15 lesson).
+ADD (missing day) stays spot-guarded: only if |TAIFEX一般 − spot| ≤ SPOT_ADD_TOL.
 If spot cannot be fetched, the run ABORTS (never guesses).
 
 Lesson: a prior version reconciled a wide default window on a loose "new ≠ old"
@@ -39,13 +42,34 @@ from src.data.validation import fetch_taifex_day_session_range
 from src.utils.tw_time import today_taipei
 
 # A present bar is a CORRECT *candidate* only when it diverges from TAIFEX 一般
-# by more than this (points); below it is normal basis noise. The spot-guard
-# then decides whether the change actually happens.
+# by more than this (points); below it is normal basis noise.
 CORRECT_THRESHOLD = 10.0
+# PROVENANCE: a stored close equal to the TAIFEX 盤後 (night) value within this
+# tolerance IS the night value → CORRECT to the day value WITHOUT consulting
+# spot. (2026-07-22: night 44,957 sat 131pt from spot vs day 199pt — the spot
+# distance preferred the night value on a small day/night-gap date. Identity
+# evidence outranks a distance judgment; spot stays the tiebreaker only when
+# the stored value matches no known candidate.)
+PROV_TOL = 1.0
 # ADD a missing day only when the re-fetched TAIFEX 一般 is within this of spot
 # (a night/anomalous re-fetch would be far from the day-session spot close).
 SPOT_ADD_TOL = 400.0
 _COLS = ["open", "high", "low", "close", "volume"]
+
+
+def _fetch_nights(start: date, end: date) -> dict:
+    """{Timestamp: TAIFEX 盤後 close} over the range — provenance candidates.
+
+    Degrades to {} on failure (provenance check simply cannot fire; the
+    spot-guard rules still apply unchanged).
+    """
+    try:
+        from scripts.scan_pollution import _taifex_night
+
+        return _taifex_night(start, end)
+    except Exception as exc:
+        print(f"⚠️ 盤後 (night) candidates unavailable ({exc}) — provenance check off")
+        return {}
 
 
 def _trading_days(start: date, end: date) -> list[date]:
@@ -96,12 +120,13 @@ def reconcile(parquet_path: Path, start: date, end: date, apply: bool) -> int:
         print("🔴 spot (^TWII) unavailable — refusing to reconcile without the "
               "spot-guard (install yfinance or run where it is available).")
         return 1
+    nights = _fetch_nights(start, end)
 
     days = _trading_days(start, end)
     print(f"\nRange: {start} → {end}  ({len(days)} trading days)  parquet={parquet_path.name}")
-    print(f"{'date':12}{'parquet':>9}{'TAIFEX一般':>11}{'spot':>9}"
+    print(f"{'date':12}{'parquet':>9}{'TAIFEX一般':>11}{'盤後':>9}{'spot':>9}"
           f"{'|old-sp|':>9}{'|new-sp|':>9}   action")
-    print("-" * 74)
+    print("-" * 84)
 
     plan: list[tuple[pd.Timestamp, str]] = []
     for d in days:
@@ -109,32 +134,39 @@ def reconcile(parquet_path: Path, start: date, end: date, apply: bool) -> int:
         t_close = float(tx.loc[ts, "close"]) if ts in tx.index else None
         p_close = float(df.loc[ts, "close"]) if ts in df.index else None
         s_close = spot.get(ts.normalize())
+        n_close = nights.get(ts)
 
         old_sp = abs(p_close - s_close) if (p_close is not None and s_close is not None) else None
         new_sp = abs(t_close - s_close) if (t_close is not None and s_close is not None) else None
 
         if t_close is None:
             action = "SKIP (no TAIFEX day bar)"
-        elif s_close is None:
-            action = "SKIP (no spot — cannot guard)"
         elif p_close is None:
             # missing day → ADD, guarded on spot proximity
-            if new_sp <= SPOT_ADD_TOL:
+            if s_close is None:
+                action = "SKIP ADD (no spot — cannot guard)"
+            elif new_sp <= SPOT_ADD_TOL:
                 action = "ADD"
                 plan.append((ts, "ADD"))
             else:
                 action = f"SKIP ADD (new {new_sp:.0f}>{SPOT_ADD_TOL:.0f} from spot — not day?)"
         elif abs(p_close - t_close) <= CORRECT_THRESHOLD:
             action = "ok"
+        elif n_close is not None and abs(p_close - n_close) <= PROV_TOL:
+            # PROVENANCE outranks spot distance: stored IS the 盤後 value.
+            action = f"CORRECT (provenance NIGHT: stored==盤後 {n_close:,.0f})"
+            plan.append((ts, "CORRECT"))
+        elif s_close is None:
+            action = "SKIP (no spot — cannot guard)"
         elif new_sp < old_sp:
             action = f"CORRECT (spot: {old_sp:.0f}→{new_sp:.0f})"
             plan.append((ts, "CORRECT"))
         else:
-            action = f"SKIP (old closer to spot {old_sp:.0f}≤{new_sp:.0f})"
+            action = f"SKIP (不等於任一候選且 old 較貼 spot {old_sp:.0f}≤{new_sp:.0f})"
 
         def _f(x):
             return f"{x:,.0f}" if x is not None else "—"
-        print(f"{str(d):12}{_f(p_close):>9}{_f(t_close):>11}{_f(s_close):>9}"
+        print(f"{str(d):12}{_f(p_close):>9}{_f(t_close):>11}{_f(n_close):>9}{_f(s_close):>9}"
               f"{_f(old_sp):>9}{_f(new_sp):>9}   {action}")
 
     n_add = sum(1 for _, a in plan if a == "ADD")

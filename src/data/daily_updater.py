@@ -194,11 +194,13 @@ def update(
         _vday = new_bars.index[-1].date()
         _vclose = float(new_bars["close"].iloc[-1])
         level, vdiffs = validate_fn(_vday, _vclose)
-        if level == "alert" or _spot_flags_bar(_vday, _vclose):
-            # Either the cross-source oracles flagged it, OR the night-proof spot
-            # index says this isn't a day value (a silent night bar the same-
-            # family oracles miss). Resolve the true day close from 3 sources;
-            # write it, or fail loud + reject if nothing is consistent with spot.
+        if (level == "alert" or _spot_flags_bar(_vday, _vclose)
+                or _night_provenance(_vday, _vclose)):
+            # Cross-source oracles flagged it, OR the night-proof spot index
+            # says this isn't a day value, OR the close bit-equals the TAIFEX
+            # 盤後 value (provenance — catches the small day/night-gap night
+            # bar that sits within the spot band, e.g. 2026-07-22). Resolve
+            # the true day close; write it, or fail loud + reject.
             rescued = _rescue_divergent_bar(_vday, new_bars.iloc[[-1]], _notify)
             if rescued is None:
                 detail = "; ".join(str(cd) for cd in vdiffs) or "spot 判定為夜盤/異常"
@@ -393,6 +395,62 @@ def _taifex_day_bar(day: date) -> pd.DataFrame | None:
     return tx.loc[[ts]] if ts in tx.index else None
 
 
+# A bar whose close equals the TAIFEX 盤後 (night) value within this tolerance
+# IS the night value — provenance, not a distance judgment. TAIFEX prices are
+# integers; 1.0 tolerates float representation only.
+_PROV_TOL = 1.0
+
+
+def _taifex_night_close(day: date) -> float | None:
+    """TAIFEX 盤後 (night) close for *day*'s nearest monthly contract, or None.
+
+    Used as PROVENANCE evidence: a stored/fetched close that bit-equals the
+    盤後 value is a night bar regardless of how close it sits to spot — the
+    2026-07-22 case (night 44,957 only 131pt from spot) slipped through the
+    spot gate precisely because the day/night gap (330pt) was below basis
+    noise. Provenance outranks the spot distance; spot remains the tiebreaker
+    only when the value matches no known candidate.
+    """
+    import io
+
+    try:
+        from scripts.init_data import _download_taifex_csv
+
+        raw = _download_taifex_csv(day.year, day.month, "MTX")
+        lines = raw.strip().split("\n")
+        df = pd.read_csv(
+            io.StringIO("\n".join(x.rstrip(", ") for x in lines)), index_col=False,
+        )
+        df["_d"] = pd.to_datetime(df["交易日期"].astype(str).str.strip(), errors="coerce")
+        df = df[df["_d"] == pd.Timestamp(day)]
+        df["_e"] = df["到期月份(週別)"].astype(str).str.strip()
+        df = df[df["_e"].str.match(r"^\d{6}$")]
+        if df.empty:
+            return None
+        nm = sorted(df["_e"].unique())[0]
+        x = df[(df["_e"] == nm)
+               & (df["交易時段"].astype(str).str.strip() == "盤後")]["收盤價"]
+        if not len(x):
+            return None
+        return float(str(x.iloc[0]).replace(",", ""))
+    except Exception as exc:
+        logger.warning("daily_updater: night-close fetch failed for %s: %s", day, exc)
+        return None
+
+
+def _night_provenance(day: date, close: float) -> bool:
+    """True when *close* IS the TAIFEX night value for *day* (and not the day
+    value) — the definitive small-gap pollution signature the spot gate cannot
+    see. Degrades to False on any fetch failure."""
+    n_close = _taifex_night_close(day)
+    if n_close is None or abs(close - n_close) > _PROV_TOL:
+        return False
+    tx = _taifex_day_bar(day)
+    if tx is None:
+        return False
+    return abs(close - float(tx["close"].iloc[-1])) > _PROV_TOL
+
+
 def _spot_flags_bar(day: date, close: float) -> bool:
     """True when the night-proof spot index (^TWII) says *close* is NOT a day
     value — a silent night bar the same-family TAIFEX/Shioaji oracles would miss
@@ -432,6 +490,21 @@ def _rescue_divergent_bar(
     tx = _taifex_day_bar(day)
     s_close = float(bar["close"].iloc[-1])
     t_close = float(tx["close"].iloc[-1]) if tx is not None else None
+
+    # PROVENANCE FIRST: a bar that bit-equals the TAIFEX 盤後 value IS the
+    # night bar — substitute the day value without consulting spot (on a
+    # small day/night-gap date the spot distance can prefer the night value:
+    # 2026-07-22, night 131pt vs day 199pt from spot).
+    if tx is not None and t_close is not None and abs(s_close - t_close) > _PROV_TOL:
+        n_close = _taifex_night_close(day)
+        if n_close is not None and abs(s_close - n_close) <= _PROV_TOL:
+            if notify_fn is not None:
+                notify_fn(
+                    f"⚠️ {day} bar close={s_close:,.0f} == TAIFEX 盤後(夜盤)值 "
+                    f"(provenance) — 改用 一般 日盤 {t_close:,.0f}"
+                )
+            return tx
+
     spot = fetch_spot_close(day)
     val, detail = resolve_day_close(day, taifex=t_close, shioaji=s_close, spot=spot)
     if val is None:
@@ -655,10 +728,11 @@ def ensure_parquet_fresh(
         if validate_fn is not None:
             vclose = float(bar["close"].iloc[-1])
             level, vdiffs = validate_fn(d, vclose)
-            if level == "alert" or _spot_flags_bar(d, vclose):
-                # Cross-source oracles flagged it, OR the night-proof spot index
-                # says this isn't a day value. Resolve the true day close from 3
-                # sources; write it, or fail loud + reject if none matches spot.
+            if (level == "alert" or _spot_flags_bar(d, vclose)
+                    or _night_provenance(d, vclose)):
+                # Oracles flagged it, OR spot says night, OR the close
+                # bit-equals the TAIFEX 盤後 value (provenance — the small-gap
+                # night bar the spot band cannot see, e.g. 2026-07-22).
                 rescued = _rescue_divergent_bar(d, bar, _notify)
                 if rescued is None:
                     detail = "; ".join(str(cd) for cd in vdiffs) or "spot 判定為夜盤/異常"
