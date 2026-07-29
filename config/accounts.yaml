@@ -13,6 +13,11 @@ accounts:
       atr_stop_mult: 2.0
       confirm_days: 2
       adx_threshold: 25
+      # ── Restart-gate switches (2026-07-28 後新增；預設全關，啟用值待裁示) ──
+      # risk_cap_pct: 0.15          # 停損風險 (2×ATR×口數×50) ≤ 15% equity，超標降口數
+      # margin_buffer_atr: 1.0      # 需保留 ≥ 1×ATR×口數×50 的保證金緩衝
+      # cooldown_days: 5            # 濾網A：停損出場後 N 交易日內不再進場
+      # reentry_above_ema_fast: true  # 濾網B：close 須站回 EMA30 才進場
     # Ladder built ONCE to equity = 10,000,000 by a fixed rule — never hand-tune:
     #   起始 350K → 2 口；每 +120K equity → +1 口（350K=2, 470K=3, …, 9.95M=82）。
     # 口數最終由 equity/margin 決定：實際口數 = min(ladder, floor(equity/margin), max_contracts)。

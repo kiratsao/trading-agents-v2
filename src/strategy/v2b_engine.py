@@ -144,6 +144,10 @@ class V2bEngine:
         chandelier_lookback: int = 20,
         chandelier_mult: float = 3.0,
         margin_per_contract: float | None = None,
+        risk_cap_pct: float | None = None,
+        margin_buffer_atr: float | None = None,
+        cooldown_days: int = 0,
+        reentry_require_above_ema_fast: bool = False,
     ) -> None:
         product = product.upper()
         if product not in _TICK_VALUE:
@@ -169,6 +173,78 @@ class V2bEngine:
         self.chandelier_lookback = chandelier_lookback
         self.margin_per_contract = margin_per_contract
         self.chandelier_mult = chandelier_mult
+
+        # ── Restart-gate switches (2026-07-28 incident follow-up) ──────────
+        # ALL default OFF — behavior is bit-identical to the pre-gate engine
+        # unless explicitly enabled in config. Values pending operator裁示.
+        # risk_cap_pct: entry sizing cap — stop risk (trail_atr_mult × ATR ×
+        #   tick × n) must not exceed risk_cap_pct × equity. n reduced; 0 → skip.
+        # margin_buffer_atr: additionally require equity − n×margin ≥
+        #   margin_buffer_atr × ATR × tick × n (margin-call buffer).
+        # cooldown_days: block re-entry for N trading bars after a
+        #   trailing/chandelier stop exit (filter A). NOTE: the stop marker
+        #   lives on the engine instance — a daemon restart clears it.
+        # reentry_require_above_ema_fast: entry additionally requires
+        #   close > EMA(ema_fast) (filter B).
+        self.risk_cap_pct = risk_cap_pct
+        self.margin_buffer_atr = margin_buffer_atr
+        self.cooldown_days = int(cooldown_days or 0)
+        self.reentry_require_above_ema_fast = bool(reentry_require_above_ema_fast)
+        self._last_stop_ts: pd.Timestamp | None = None
+
+    # ------------------------------------------------------------------
+    # Restart-gate helpers (all no-ops unless the switches are enabled)
+    # ------------------------------------------------------------------
+
+    def _entry_filter_block(self, data: pd.DataFrame, close: float, ema_f: float) -> str | None:
+        """Re-entry filters A (cooldown) / B (EMA reclaim). None = entry allowed."""
+        if self.reentry_require_above_ema_fast and close < ema_f:
+            return (
+                f"re-entry filter B: close={close:.0f} < EMA{self.ema_fast}={ema_f:.0f}"
+                f" — 未站回均線,不進場"
+            )
+        if self.cooldown_days > 0 and self._last_stop_ts is not None:
+            pos = data.index.searchsorted(self._last_stop_ts, side="right")
+            bars_since = len(data.index) - pos
+            if 0 <= bars_since <= self.cooldown_days:
+                return (
+                    f"re-entry filter A: cooldown {bars_since}/{self.cooldown_days} 日"
+                    f" (stop @ {self._last_stop_ts.date()})"
+                )
+        return None
+
+    def _risk_capped_contracts(self, n: int, equity: float, atr_v: float) -> tuple[int, str]:
+        """Cap entry size by stop-risk and margin-buffer gates.
+
+        Returns (capped n, note). risk/口 = trail_atr_mult × ATR × tick;
+        n_cap = floor(risk_cap_pct × equity / risk/口). Margin buffer:
+        n ≤ equity / (margin + margin_buffer_atr × ATR × tick).
+        """
+        if atr_v <= 0 or n <= 0:
+            return n, ""
+        import math as _math
+
+        tick = self.point_value
+        note_parts = []
+        if self.risk_cap_pct:
+            risk_per = self.trail_atr_mult * atr_v * tick
+            n_cap = int(_math.floor(self.risk_cap_pct * equity / risk_per))
+            if n_cap < n:
+                note_parts.append(
+                    f"risk-cap {self.risk_cap_pct:.0%}: {n}→{n_cap}口 "
+                    f"(stop風險 {risk_per:,.0f}/口, cap {self.risk_cap_pct * equity:,.0f})"
+                )
+                n = n_cap
+        if self.margin_buffer_atr:
+            margin = self.margin_per_contract or _MTX_MARGIN
+            denom = margin + self.margin_buffer_atr * atr_v * tick
+            n_buf = int(_math.floor(equity / denom)) if denom > 0 else n
+            if n_buf < n:
+                note_parts.append(
+                    f"margin-buffer {self.margin_buffer_atr:.0f}×ATR: {n}→{n_buf}口"
+                )
+                n = n_buf
+        return max(0, n), "; ".join(note_parts)
 
     # ------------------------------------------------------------------
     # Public API
@@ -242,6 +318,7 @@ class V2bEngine:
                 lookback_high = float(data["high"].iloc[-self.chandelier_lookback :].max())
                 stop = lookback_high - self.chandelier_mult * atr_v
                 if close < stop:
+                    self._last_stop_ts = cur_ts  # cooldown filter A marker
                     tsmc_note = (
                         " [tsmc bearish tighten]"
                         if (tsmc_signal and getattr(tsmc_signal, "direction_bias", "") == "bearish")
@@ -256,6 +333,7 @@ class V2bEngine:
             else:
                 trail_stop = hh - self.trail_atr_mult * atr_v
                 if close < trail_stop:
+                    self._last_stop_ts = cur_ts  # cooldown filter A marker
                     tsmc_note = (
                         " [tsmc bearish tighten]"
                         if (tsmc_signal and getattr(tsmc_signal, "direction_bias", "") == "bearish")
@@ -289,6 +367,14 @@ class V2bEngine:
                 # Hard ceiling from config
                 if self.max_contracts is not None and self.max_contracts > 0:
                     max_total = min(max_total, self.max_contracts)
+                # Risk-cap gate applies to the TOTAL position on adds too
+                if self.risk_cap_pct:
+                    risk_per = self.trail_atr_mult * atr_v * self.point_value
+                    if risk_per > 0:
+                        max_total = min(
+                            max_total,
+                            int(equity * self.risk_cap_pct // risk_per),
+                        )
                 add_n = min(add_n, max(0, max_total - cur_contracts))
                 if add_n <= 0:
                     return Signal(
@@ -322,6 +408,17 @@ class V2bEngine:
                     "hold", 0,
                     f"ADX too low — no trend (ADX={adx_v:.1f} < {self.adx_threshold})",
                 )
+            block = self._entry_filter_block(data, close, ema_f)
+            if block:
+                return Signal("hold", 0, block)
+            n_contracts, gate_note = self._risk_capped_contracts(
+                n_contracts, equity, atr_v,
+            )
+            if n_contracts <= 0:
+                return Signal(
+                    "hold", 0,
+                    f"risk-cap gate: 0口可進 ({gate_note}) — 跳過進場",
+                )
             trail_stop = close - self.trail_atr_mult * atr_v
             return Signal(
                 "buy",
@@ -330,6 +427,7 @@ class V2bEngine:
                     f"golden cross + {bull_streak}-day confirmation: "
                     f"EMA{self.ema_fast}={ema_f:.0f} > EMA{self.ema_slow}={ema_s:.0f}"
                     f" ADX={adx_v:.0f}"
+                    + (f" [{gate_note}]" if gate_note else "")
                 ),
                 stop_loss=trail_stop,
             )
@@ -341,6 +439,17 @@ class V2bEngine:
             and golden
             and bull_streak >= max(1, self.confirm_days - 1)
         ):
+            block = self._entry_filter_block(data, close, ema_f)
+            if block:
+                return Signal("hold", 0, block)
+            n_contracts, gate_note = self._risk_capped_contracts(
+                n_contracts, equity, atr_v,
+            )
+            if n_contracts <= 0:
+                return Signal(
+                    "hold", 0,
+                    f"risk-cap gate: 0口可進 ({gate_note}) — 跳過進場",
+                )
             trail_stop = close - self.trail_atr_mult * atr_v
             return Signal(
                 "buy",

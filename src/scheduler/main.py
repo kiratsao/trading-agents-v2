@@ -100,6 +100,12 @@ def _build_orchestrators(cfg: dict, live: bool = False) -> dict:
             ladder=ladder,
             max_contracts=acc.get("max_contracts"),
             margin_per_contract=acc.get("margin_per_contract"),
+            # Restart-gate switches — ALL default off (see v2b_engine.__init__);
+            # enable per-account in accounts.yaml strategy_params after裁示.
+            risk_cap_pct=params.get("risk_cap_pct"),
+            margin_buffer_atr=params.get("margin_buffer_atr"),
+            cooldown_days=params.get("cooldown_days", 0),
+            reentry_require_above_ema_fast=params.get("reentry_above_ema_fast", False),
         )
         # Per-account override of the product-level default for settlement
         # behavior (e.g. you could disable rollover for an MXF account that
