@@ -78,6 +78,15 @@ def scan(parquet_path: Path, start: date, end: date) -> list[dict]:
     for ts in df.index:
         d_close = float(day.loc[ts, "close"]) if (day is not None and ts in day.index) else None
         if d_close is None:
+            # Date-set validation (2026-07-10 幽靈 bar 教訓): a stored bar whose
+            # date has NO TAIFEX 一般 row is a phantom — the date never traded a
+            # day session (颱風/封關). Value checks can't see it; flag it here.
+            checked += 1
+            flagged.append({
+                "date": ts.date(), "stored": float(df.loc[ts, "close"]),
+                "taifex_day": None, "taifex_night": night.get(ts),
+                "spot": spot.get(ts.date()), "class": "PHANTOM",
+            })
             continue
         checked += 1
         p = float(df.loc[ts, "close"])
@@ -95,12 +104,17 @@ def scan(parquet_path: Path, start: date, end: date) -> list[dict]:
     if flagged:
         print(f"{'date':12}{'stored':>9}{'day(一般)':>10}{'night(盤後)':>12}{'spot':>9}   class")
         for f in flagged:
+            dv = f"{f['taifex_day']:,.0f}" if f["taifex_day"] is not None else "—"
             n = f"{f['taifex_night']:,.0f}" if f["taifex_night"] is not None else "—"
             s = f"{f['spot']:,.0f}" if f["spot"] is not None else "—"
-            print(f"{str(f['date']):12}{f['stored']:>9,.0f}{f['taifex_day']:>10,.0f}"
+            print(f"{str(f['date']):12}{f['stored']:>9,.0f}{dv:>10}"
                   f"{n:>12}{s:>9}   {f['class']}")
-        print("\n→ review, then fix with: scripts/reconcile_recent_bars.py "
-              f"--from {flagged[0]['date']} --to {flagged[-1]['date']}")
+        if any(f["class"] == "PHANTOM" for f in flagged):
+            print("\n→ PHANTOM = 該日 TAIFEX 無日盤列 (非交易日): 刪除該列並補入 "
+                  "tw_holidays._ANNUAL_HOLIDAYS — 勿用 reconcile 改值")
+        if any(f["class"] != "PHANTOM" for f in flagged):
+            print("\n→ NIGHT/ANOMALY: review, then fix with: scripts/reconcile_recent_bars.py "
+                  f"--from {flagged[0]['date']} --to {flagged[-1]['date']}")
     else:
         print("  ✅ no night pollution / anomalies found.")
     return flagged

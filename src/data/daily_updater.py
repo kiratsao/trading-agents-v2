@@ -187,6 +187,20 @@ def update(
             "error": None,
         }
 
+    # 5a. 幽靈-bar 防護: every date about to be appended must be a TAIFEX-
+    #     confirmed trading day (2026-07-10 颱風日教訓 — see _calendar_guard).
+    _guard_ok = [_calendar_guard(ts.date(), _notify) for ts in new_bars.index]
+    if not all(_guard_ok):
+        new_bars = new_bars[list(_guard_ok)]
+        if new_bars.empty:
+            return {
+                "success": False,
+                "bars_added": 0,
+                "gaps_filled": 0,
+                "latest_date": str(last_date),
+                "error": "calendar guard refused all new bars (幽靈bar防護)",
+            }
+
     # 5b. Cross-source validation of the newest bar BEFORE persisting (B2).
     #     >ALERT-pt divergence vs an independent oracle → refuse to write so a
     #     bad bar never contaminates the parquet (the off-by-1,300pt class).
@@ -337,6 +351,9 @@ def _detect_and_fill_gaps(
     filled = 0
     still_missing: list[date] = []
     for d in missing:
+        if not _calendar_guard(d, notify_fn):
+            still_missing.append(d)
+            continue
         bar: pd.DataFrame | None
         try:
             bar = fetcher(d, d)
@@ -393,6 +410,52 @@ def _taifex_day_bar(day: date) -> pd.DataFrame | None:
         return None
     ts = pd.Timestamp(day)
     return tx.loc[[ts]] if ts in tx.index else None
+
+
+def _taifex_confirms_day(day: date) -> bool | None:
+    """Is *day* a real trading day per TAIFEX 一般 rows? (幽靈-bar 防護)
+
+    True  — TAIFEX has a 一般 row for *day*.
+    False — the month downloaded fine but *day* has no 一般 row: an ad-hoc
+            closure the holiday table missed (颱風/封關) — never write a bar.
+    None  — download/parse failed: indeterminate, retry next run.
+    """
+    import calendar as _cal
+
+    from src.data.validation import fetch_taifex_day_session_range
+
+    m_start = date(day.year, day.month, 1)
+    m_end = date(day.year, day.month, _cal.monthrange(day.year, day.month)[1])
+    try:
+        tx = fetch_taifex_day_session_range(m_start, m_end)
+    except Exception as exc:
+        logger.warning("daily_updater: calendar-guard fetch failed for %s: %s", day, exc)
+        return None
+    if tx is None or tx.empty:
+        return None
+    return pd.Timestamp(day) in tx.index
+
+
+def _calendar_guard(day: date, notify_fn) -> bool:
+    """Refuse to write a bar for a date TAIFEX doesn't confirm as a trading day.
+
+    2026-07-10 幽靈 bar: 颱風休市日不在假日表, update() 於 7/13 把 7/09 夜盤的
+    00:00–05:00 段聚成 7/10「日K」寫入 (close 46,275) — ADX 24.82→28.36 跨過
+    進場門檻, 誘發 7/22 資料假訊號進場。所有寫入這裡的日期都是已完結的過去日,
+    TAIFEX 一般 必須已有該列; 下載失敗也拒寫 (fail-closed — 缺口可日後補回,
+    幽靈 bar 是毒藥) 但訊息註明重試。"""
+    ok = _taifex_confirms_day(day)
+    if ok:
+        return True
+    if ok is None:
+        msg = (f"⚠️ {day.isoformat()} 無法向 TAIFEX 確認交易日 (下載失敗) — "
+               f"本輪不寫入，下次更新重試")
+    else:
+        msg = (f"🔴 {day.isoformat()} TAIFEX 無一般(日盤)列 — 非交易日，拒寫幽靈 bar "
+               f"(臨時休市日請補入 tw_holidays._ANNUAL_HOLIDAYS)")
+    logger.error(msg)
+    notify_fn(msg)
+    return False
 
 
 # A bar whose close equals the TAIFEX 盤後 (night) value within this tolerance
@@ -715,6 +778,9 @@ def ensure_parquet_fresh(
     still_missing: list[date] = []
     filled = 0
     for d in missing:
+        if not _calendar_guard(d, _notify):
+            still_missing.append(d)
+            continue
         bar = _fetch_day_with_retry(fetch, d, _sleep)
         if bar is None or bar.empty:
             still_missing.append(d)
