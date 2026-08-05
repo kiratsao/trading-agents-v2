@@ -346,3 +346,57 @@ class TestEntryDateWritten:
             orch2.run_daily(broker=None)
         assert sell_state.position == 0
         assert sell_state.entry_date is None
+
+
+class TestProvenanceGateLive:
+    """7/22-class small-gap night bar on the LIVE path: close bit-equals
+    today's TAIFEX 盤後 row (= last night) while sitting INSIDE the spot band —
+    completeness and spot both pass, provenance must still reject (entries
+    fail-closed, exit falls to the proxy path)."""
+
+    _D722 = date(2026, 7, 22)
+
+    @staticmethod
+    def _day_frame(close: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            [{"open": close, "high": close, "low": close, "close": close,
+              "volume": 150_000}],
+            index=pd.DatetimeIndex([pd.Timestamp("2026-07-22")], name="date"),
+        )
+
+    def _setup(self, monkeypatch):
+        from src.data import daily_updater
+
+        monkeypatch.setattr("src.data.spot_ref.fetch_spot_close",
+                            lambda d, **k: 44_826.0)
+        monkeypatch.setattr(daily_updater, "_taifex_night_close",
+                            lambda d: 44_957.0)
+        monkeypatch.setattr(daily_updater, "_taifex_day_bar",
+                            lambda d: self._day_frame(44_627.0))
+
+    def test_night_value_rejected_despite_spot_pass(self, monkeypatch):
+        self._setup(monkeypatch)
+        bar = _bar(44_957.0, last_ts="2026-07-22T13:44:00+08:00")
+        meta = _validate_today_bar(bar, self._D722, source="kbars")
+        assert meta["night_hit"] is True
+        assert meta["validated"] is False
+        assert meta["usable_for_exit"] is False
+        assert "provenance" in meta["reject"]
+        assert "盤後值" in meta["desc"]
+
+    def test_day_value_passes(self, monkeypatch):
+        self._setup(monkeypatch)
+        bar = _bar(44_627.0, last_ts="2026-07-22T13:44:00+08:00")
+        meta = _validate_today_bar(bar, self._D722, source="kbars")
+        assert meta["night_hit"] is False
+        assert meta["validated"] is True
+
+    def test_provenance_unavailable_degrades_open(self, monkeypatch):
+        # conftest nulls _taifex_night_close/_taifex_day_bar → provenance
+        # degrades False; behavior identical to pre-gate (spot+completeness).
+        monkeypatch.setattr("src.data.spot_ref.fetch_spot_close",
+                            lambda d, **k: 44_826.0)
+        bar = _bar(44_957.0, last_ts="2026-07-22T13:44:00+08:00")
+        meta = _validate_today_bar(bar, self._D722, source="kbars")
+        assert meta["night_hit"] is False
+        assert meta["validated"] is True

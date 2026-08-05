@@ -212,6 +212,25 @@ class TestCalendarGuard:
         out = pd.read_parquet(pq)
         assert pd.Timestamp("2026-07-09") not in out.index
 
+    def test_update_lock_timeout_skips_cycle(self, monkeypatch, tmp_path):
+        """A concurrently-held write lock makes update() skip loudly instead of
+        interleaving a read-modify-write (daemon vs systemd-timer race)."""
+        import fcntl
+
+        pq = tmp_path / "MXF.parquet"
+        lock_path = pq.with_suffix(pq.suffix + ".lock")
+        monkeypatch.setattr(daily_updater, "_LOCK_WAIT_S", 0.1)
+        holder = open(lock_path, "w")
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            notes: list[str] = []
+            res = daily_updater.update(parquet_path=pq, notify_fn=notes.append)
+            assert res["success"] is False
+            assert "寫入鎖" in res["error"]
+            assert any("寫入鎖" in n for n in notes)
+        finally:
+            holder.close()
+
     def test_incident_0713_cannot_recur(self, monkeypatch, tmp_path):
         """With 7/10 in the holiday table, the exact 7/13 14:25 run no longer
         even attempts a fetch for 7/10 — already-up-to-date branch, no ghost."""

@@ -14,3 +14,9 @@ def _hermetic_calendar_guard(monkeypatch):
     from src.data import daily_updater
 
     monkeypatch.setattr(daily_updater, "_taifex_confirms_day", lambda d: True)
+    # The live provenance gate (orchestrator._validate_today_bar → daily_updater
+    # ._night_provenance) fetches TAIFEX month CSVs. Null the two underlying
+    # fetchers so provenance degrades to False offline; tests exercising real
+    # provenance semantics re-patch these themselves (they already did).
+    monkeypatch.setattr(daily_updater, "_taifex_night_close", lambda d: None)
+    monkeypatch.setattr(daily_updater, "_taifex_day_bar", lambda d: None)

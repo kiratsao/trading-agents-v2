@@ -39,7 +39,84 @@ _PRIMARY_PARQUET = _DATA_DIR / "MXF_Daily_Clean_2020_to_now.parquet"
 _GAP_SCAN_LOOKBACK_DAYS = 10
 
 
+_LOCK_WAIT_S = 240.0
+
+
+class _ParquetLockTimeout(TimeoutError):
+    pass
+
+
+class _parquet_write_lock:
+    """Serialize parquet read-modify-write across processes (daemon 14:25
+    updater vs systemd-timer 14:10 CLI). Readers need no lock — every write is
+    an atomic tmp+os.replace, so a reader sees the old or the new file, never a
+    torn one. The lock closes the remaining race: two updaters both reading v0
+    and one side's appended bars getting overwritten. flock is kernel-released
+    on process death — no stale-lock failure mode. On timeout we SKIP the cycle
+    loudly (the other updater is actively writing; the next run catches up via
+    the gap scan) instead of interleaving."""
+
+    def __init__(self, parquet_path: Path, notify_fn):
+        self._path = Path(parquet_path)
+        self._notify = notify_fn
+        self._f = None
+
+    def __enter__(self):
+        import fcntl
+        import time as _time
+
+        lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._f = open(lock_path, "w")  # noqa: SIM115 — held for lock lifetime
+        deadline = _time.monotonic() + _LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(self._f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if _time.monotonic() >= deadline:
+                    msg = (
+                        f"🔴 parquet 寫入鎖等待逾時 ({int(_LOCK_WAIT_S)}s) — "
+                        f"另一個 updater 仍在寫入，本輪跳過 (下輪 gap scan 自動補)"
+                    )
+                    logger.error(msg)
+                    self._notify(msg)
+                    self._f.close()
+                    self._f = None
+                    raise _ParquetLockTimeout(msg) from None
+                _time.sleep(2)
+
+    def __exit__(self, *exc):
+        import fcntl
+
+        if self._f is not None:
+            try:
+                fcntl.flock(self._f, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self._f.close()
+        return False
+
+
 def update(
+    parquet_path: Path | None = None,
+    notify_fn: Callable[[str], Any] | None = None,
+    validate_fn: Callable[[date, float], tuple[str, list]] | None = None,
+) -> dict:
+    """Locked wrapper around ``_update_locked`` — see ``_parquet_write_lock``."""
+    pq = Path(parquet_path or _PRIMARY_PARQUET)
+    _notify = notify_fn or (lambda msg: None)
+    try:
+        with _parquet_write_lock(pq, _notify):
+            return _update_locked(parquet_path, notify_fn, validate_fn)
+    except _ParquetLockTimeout as exc:
+        return {
+            "success": False, "bars_added": 0, "gaps_filled": 0,
+            "latest_date": None, "error": str(exc),
+        }
+
+
+def _update_locked(
     parquet_path: Path | None = None,
     notify_fn: Callable[[str], Any] | None = None,
     validate_fn: Callable[[date, float], tuple[str, list]] | None = None,
@@ -244,7 +321,7 @@ def update(
     df = pd.concat([df, new_bars]).sort_index()
     df.index = pd.to_datetime(df.index)
     df.index.name = "date"
-    df.to_parquet(parquet_path, index=True)
+    _atomic_write_parquet(df, parquet_path)
     n_new = len(new_bars)
     new_last = df.index[-1].date()
     last_close = float(df["close"].iloc[-1])
@@ -388,7 +465,7 @@ def _detect_and_fill_gaps(
         df = pd.concat([df, bar]).sort_index()
         df.index = pd.to_datetime(df.index)
         df.index.name = "date"
-        df.to_parquet(parquet_path, index=True)
+        _atomic_write_parquet(df, parquet_path)
         filled += 1
         logger.info("daily_updater: back-filled %s", d)
         notify_fn(f"✅ {d.isoformat()} 日K補回成功")
@@ -721,6 +798,32 @@ _RETRY_BACKOFFS = (30, 60, 120)
 
 
 def ensure_parquet_fresh(
+    parquet_path: Path | None = None,
+    notify_fn: Callable[[str], Any] | None = None,
+    validate_fn: Callable[[date, float], tuple[str, list]] | None = None,
+    *,
+    now=None,
+    fetch_override: Callable[[date, date], pd.DataFrame | None] | None = None,
+    sleep=None,
+) -> dict:
+    """Locked wrapper around ``_ensure_parquet_fresh_locked`` — lock timeout is
+    surfaced as ``DataIntegrityError`` per this function's raises-or-returns
+    contract (see ``_parquet_write_lock``)."""
+    from src.utils.freshness import DataIntegrityError
+
+    pq = Path(parquet_path or _PRIMARY_PARQUET)
+    _notify = notify_fn or (lambda msg: None)
+    try:
+        with _parquet_write_lock(pq, _notify):
+            return _ensure_parquet_fresh_locked(
+                parquet_path, notify_fn, validate_fn,
+                now=now, fetch_override=fetch_override, sleep=sleep,
+            )
+    except _ParquetLockTimeout as exc:
+        raise DataIntegrityError(str(exc)) from exc
+
+
+def _ensure_parquet_fresh_locked(
     parquet_path: Path | None = None,
     notify_fn: Callable[[str], Any] | None = None,
     validate_fn: Callable[[date, float], tuple[str, list]] | None = None,

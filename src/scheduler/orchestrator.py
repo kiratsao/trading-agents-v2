@@ -1452,8 +1452,21 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
     except Exception as exc:
         logger.warning("_validate_today_bar: spot gate unavailable (%s)", exc)
 
-    validated = bool(complete and spot_ok)
-    usable_for_exit = (
+    # (c) Provenance gate — the 7/22-class small-gap night bar: a close that
+    #     bit-equals today's TAIFEX 盤後 row (= last night's session, published
+    #     by ~14:00) is a night value even when it sits INSIDE the spot band
+    #     (7/22: night 44,957 only 131pt from spot). Degrades to False when
+    #     TAIFEX hasn't published today's rows yet or the fetch fails.
+    night_hit = False
+    try:
+        from src.data.daily_updater import _night_provenance
+
+        night_hit = bool(_night_provenance(today, close))
+    except Exception as exc:
+        logger.warning("_validate_today_bar: provenance gate unavailable (%s)", exc)
+
+    validated = bool(complete and spot_ok and not night_hit)
+    usable_for_exit = (not night_hit) and (
         validated
         or (complete and spot_ok is None)
         or (source == "snapshot" and spot_ok is True)
@@ -1462,6 +1475,8 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
     reject = None
     if not validated:
         parts = []
+        if night_hit:
+            parts.append("close==TAIFEX盤後值(provenance)")
         if source == "kbars" and not complete:
             parts.append(f"kbars截斷(末根 {last_kbar or '?'})")
         if source == "snapshot":
@@ -1473,6 +1488,8 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
         reject = "、".join(parts) or "未驗證"
 
     spot_str = f"spot誤差{spot_dev:+.0f}pt" if spot_dev is not None else "spot n/a"
+    if night_hit:
+        spot_str += " ⛔盤後值"
     icon = "✅" if validated else ("⚠️" if usable_for_exit else "🔴")
     desc = f"{source}(末根 {last_kbar}) {spot_str} {icon}" if source == "kbars" else \
            f"{source} {spot_str} {icon}"
@@ -1480,6 +1497,7 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
     return {
         "source": source, "last_kbar": last_kbar, "complete": complete,
         "spot": spot, "spot_dev": spot_dev, "spot_ok": spot_ok,
+        "night_hit": night_hit,
         "validated": validated, "usable_for_exit": usable_for_exit,
         "reject": reject, "desc": desc,
     }

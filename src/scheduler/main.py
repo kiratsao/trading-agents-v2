@@ -69,6 +69,56 @@ def _data_path_for(product: str) -> Path:
     return Path(f"data/{product}_Daily_Clean_2020_to_now.parquet")
 
 
+# ── Config-key validation (fail-loud) ────────────────────────────────
+# _build_orchestrators consumes keys via params.get(...) — any key outside
+# these sets is a SILENT no-op: the operator believes a knob is wired when it
+# is not (the "以為調得動、其實沒接上" class; e.g. a typo `risk_cap` instead of
+# `risk_cap_pct` would quietly disable the risk cap on a live account).
+# Unknown keys abort startup; known-but-inert keys warn.
+_KNOWN_STRATEGY_KEYS = {
+    "ema_fast", "ema_slow", "atr_stop_mult", "confirm_days", "adx_threshold",
+    "risk_cap_pct", "margin_buffer_atr", "cooldown_days", "reentry_above_ema_fast",
+}
+_KNOWN_ACCOUNT_KEYS = {
+    "product", "equity", "strategy_params", "scale_ladder", "margin_per_contract",
+    "max_contracts", "settlement_force_close", "sessions",
+}
+_KNOWN_SESSION_DAY_KEYS = {
+    "execution_timing", "decision_time", "execution_time", "enable_tsmc_signal",
+}
+_INERT_SESSION_KEYS = {
+    # cron 排程硬編 15:05 (main() 的 v2b_execution job) — 此欄位改了沒有效果。
+    "execution_time": "排程固定 15:05 (cron hardcoded)，此欄位僅文件性",
+}
+
+
+def _validate_account_config(name: str, acc: dict) -> None:
+    """Reject unknown config keys at startup instead of silently ignoring them."""
+    problems = []
+    unknown_acc = set(acc) - _KNOWN_ACCOUNT_KEYS
+    if unknown_acc:
+        problems.append(f"account 層未知 key: {sorted(unknown_acc)}")
+    unknown_sp = set(acc.get("strategy_params") or {}) - _KNOWN_STRATEGY_KEYS
+    if unknown_sp:
+        problems.append(f"strategy_params 未知 key: {sorted(unknown_sp)}")
+    sessions = acc.get("sessions") or {}
+    unknown_grp = set(sessions) - {"day"}
+    if unknown_grp:
+        problems.append(f"sessions 未知群組: {sorted(unknown_grp)}")
+    unknown_day = set(sessions.get("day") or {}) - _KNOWN_SESSION_DAY_KEYS
+    if unknown_day:
+        problems.append(f"sessions.day 未知 key: {sorted(unknown_day)}")
+    if problems:
+        raise SystemExit(
+            f"🔴 config 驗證失敗 [{name}]: " + "; ".join(problems)
+            + " — engine 不認的 key 是 silent no-op，拒絕啟動 (檢查拼字/對照 "
+            "main.py._KNOWN_*_KEYS)"
+        )
+    for k, why in _INERT_SESSION_KEYS.items():
+        if k in (sessions.get("day") or {}):
+            logger.warning("⚠️ config [%s] sessions.day.%s: %s", name, k, why)
+
+
 def _build_orchestrators(cfg: dict, live: bool = False) -> dict:
     """Build one V2bOrchestrator per account in cfg['accounts'].
 
@@ -83,6 +133,7 @@ def _build_orchestrators(cfg: dict, live: bool = False) -> dict:
     orchestrators: dict = {}
 
     for name, acc in cfg.get("accounts", {}).items():
+        _validate_account_config(name, acc)
         product = acc.get("product", "MXF")
         params = acc.get("strategy_params", {})
         ladder = [
