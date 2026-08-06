@@ -1008,7 +1008,8 @@ class V2bOrchestrator:
         else:
             self.notify_fn(
                 f"⚠️ 未取得今日({today})日盤資料，決策基於 {last_bar_date} 收盤"
-                f"（Shioaji 可能斷線）"
+                f"（無資料、時戳語義無法判定或全遭驗證拒用 — 詳見 log 的"
+                f" fetch_day_session_bar 判定行）"
             )
         return True
 
@@ -1490,8 +1491,10 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
     """Dual validation of a live today-bar (kbars AND snapshot paths).
 
     (a) Completeness — kbars only: the LAST session kbar must fall in
-        13:40–13:45 (settlement day: 13:25–13:30). A feed that died mid-morning
-        yields a truncated "close" that must never be treated as the day close.
+        13:40–13:45 INCLUSIVE (settlement day: 13:25–13:30 inclusive — the
+        official close prints in the 13:45/13:30 closing-auction bar). A feed
+        that died mid-morning yields a truncated "close" that must never be
+        treated as the day close.
     (b) Spot gate — both paths: |close − ^TWII spot| ≤ max(500, 1.6%×spot)
         (``basis_band_for``; the spot index has no night session, so it is
         night-proof truth).
@@ -1515,9 +1518,9 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
             last_kbar = ts.strftime("%H:%M")
             t = ts.time()
             if _is_settlement_day(pd.Timestamp(today)):
-                complete = _dtime(13, 25) <= t < _dtime(13, 30)
+                complete = _dtime(13, 25) <= t <= _dtime(13, 30)
             else:
-                complete = _dtime(13, 40) <= t < _dtime(13, 45)
+                complete = _dtime(13, 40) <= t <= _dtime(13, 45)
         except (TypeError, ValueError):
             complete = False
 

@@ -67,8 +67,11 @@ def test_fetcher_settlement_day_excludes_1330(monkeypatch):
 def test_fetcher_low_volume_still_returns_bar():
     # Rolling-contract historical queries report low volume — that is NOT a
     # reason to drop a valid day-session bar. Volume only warns; bar returned.
+    # 兩根 bar (含午後) — 單根 09:00 在時戳語義偵測下屬「兩解讀皆合法」退化
+    # payload (真實 payload 一定含 13:0x+ bar, −8h 讀成 05:0x 非法而可判定)。
     api = _Api(_kbars([
-        ("2026-05-15 09:00", 41_000, 41_010, 40_990, 41_005, 1_222),  # rolling-contract量
+        ("2026-05-15 09:00", 41_000, 41_010, 40_990, 41_002, 1_000),
+        ("2026-05-15 13:05", 41_002, 41_008, 41_000, 41_005, 222),  # rolling-contract量
     ]))
     bar = fetch_day_session_bar(api, None, date(2026, 5, 15))
     assert bar is not None
@@ -78,9 +81,12 @@ def test_fetcher_low_volume_still_returns_bar():
 
 def test_fetcher_end_not_plus_one():
     # kbars (fake) holds BOTH days; a fetch for 05/15 must not leak 05/16.
+    # 每日含午後 bar — 使時戳語義偵測可判定 (見上一測試的註解)。
     api = _Api(_kbars([
-        ("2026-05-15 10:00", 41_000, 41_010, 40_990, 41_009, 40_000),
-        ("2026-05-16 10:00", 42_000, 42_010, 41_990, 42_009, 40_000),
+        ("2026-05-15 10:00", 41_000, 41_010, 40_990, 41_000, 40_000),
+        ("2026-05-15 13:10", 41_000, 41_012, 40_995, 41_009, 40_000),
+        ("2026-05-16 10:00", 42_000, 42_010, 41_990, 42_000, 40_000),
+        ("2026-05-16 13:10", 42_000, 42_012, 41_995, 42_009, 40_000),
     ]))
     bar = fetch_day_session_bar(api, None, date(2026, 5, 15))
     assert bar["close"] == 41_009          # 05/16 excluded by date filter

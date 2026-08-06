@@ -101,7 +101,13 @@ Strategy: EMA(30/100), CD2, ATR×2.0 trailing, ADX(14)>25, Anti-Martingale, sett
 - **daily_updater failures must be visible** — notify_fn sends LINE alert on 🔴
 - **Settlement day** = 第三個週三，遇 TAIFEX 假日**順延至次一交易日**
   (`tw_holidays.settlement_day_of_month`)；only forces close on existing positions
-- **日K聚合** strictly 08:45-13:44, sort by ts, close = last chronological bar
+- **日K聚合** 08:45–13:45 **含 13:45 收盤集合競價 bar**(官方 close 在此;
+  settlement 日含 13:30), sort by ts, close = last chronological bar
+- **Shioaji kbars 時戳語義 per-response 偵測** — 2026-07-25 server 端把 kbars ts
+  由 UTC ns 切為台北 naive ns(依查詢時間而非 bar 日期,同 lib 兩種行為都見過)。
+  勿硬編 `utc=True`;唯一入口 `shioaji_fetcher._kbars_ts_interpretations` 用
+  結構事實(未來時戳 + 合法 session 窗)判定,無法判定即 🔴 拒用,絕不猜。
+  **歷史回補一律用 TAIFEX 一般;Shioaji 僅供當日 live bar**(語義可能再切回)
 - **TAIFEX CSV 時段**: `一般`=該日**日盤**(保留)、`盤後`=前日**夜盤**記次一交易日
   (一律丟棄，即使該日只有盤後列)。2020→2026 從未翻轉；勿再用 Shioaji 偶發回傳的
   夜盤 bar 當驗證 oracle (6bdd195 教訓)

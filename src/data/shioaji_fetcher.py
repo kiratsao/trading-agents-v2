@@ -6,9 +6,19 @@ its own subtly-wrong filter — so a fix in one left the others broken and a bad
 value once overwrote a correct parquet. ALL day-session filtering now lives
 here and nowhere else.
 
-Day session: 08:45 ≤ t < 13:45 (settlement days: 08:45 ≤ t < 13:30).
-``end`` is INCLUSIVE everywhere — never add a day (the +1 bug pulled today's
+Day session: 08:45 ≤ t ≤ 13:45 INCLUSIVE — the official close prints in the
+13:45 收盤集合競價 bar (settlement days: 08:45 ≤ t ≤ 13:30). ``end`` is
+INCLUSIVE everywhere — never add a day (the +1 bug pulled today's
 still-evolving bar and mis-stated the close by ~1,300pt).
+
+Timestamp semantics (2026-07-25 server-side switch): Shioaji kbars ``ts``
+changed from real UTC nanoseconds to Taipei-naive nanoseconds, decided by
+QUERY time not bar date (same lib, same code, both behaviors observed). A
+hardcoded ``utc=True`` double-shifted +8h, so the "day-session window"
+silently selected the previous night's 00:45–05:45 tail — every day close
+became the night close (the 7/25→8/06 degraded-feed incident). Semantics are
+now detected PER RESPONSE from structure alone (see ``_kbars_ts_interpretations``)
+— never from a date era or any label.
 """
 
 from __future__ import annotations
@@ -21,9 +31,52 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _DAY_OPEN = time(8, 45)
-_DAY_CLOSE = time(13, 45)        # normal day session ends 13:44:59
-_SETTLE_CLOSE = time(13, 30)     # settlement day regular session ends 13:30
+_DAY_CLOSE = time(13, 45)        # INCLUSIVE — 13:45 收盤集合競價 bar 是官方 close
+_SETTLE_CLOSE = time(13, 30)     # INCLUSIVE — settlement day final auction 13:30
 _KBARS_TIMEOUT = 30_000
+
+# Legal TAIFEX trading minutes: day 08:45–13:45, night 15:00–05:00 (both ends
+# inclusive). Used by the per-response ts-semantics detector: under the CORRECT
+# interpretation 100% of bars fall in these windows; the wrong one puts bars in
+# impossible hours (16:45–21:45, 05:01–08:44, 13:46–14:59).
+_NIGHT_OPEN = time(15, 0)
+_NIGHT_CLOSE = time(5, 0)
+_FUTURE_TOL = pd.Timedelta(minutes=2)
+
+
+def _legal_session_time(t: time) -> bool:
+    return (_DAY_OPEN <= t <= _DAY_CLOSE) or t >= _NIGHT_OPEN or t <= _NIGHT_CLOSE
+
+
+def _kbars_ts_interpretations(ts_ns, *, now=None) -> list[tuple[str, pd.Series]]:
+    """Structurally-valid interpretations of a kbars ``ts`` array.
+
+    Candidates: ``utc-legacy`` (ts is real UTC → +8h to Taipei) and
+    ``taipei-naive`` (ts is already Taipei wall-clock). An interpretation is
+    killed by (a) any bar in the future (> now+2min, Taipei) or (b) any bar
+    outside legal TAIFEX session minutes. Returns the survivors as
+    (name, naive-Taipei Series) — the caller decides what 0/1/2 survivors mean.
+    """
+    if now is None:
+        from src.utils.tw_time import now_taipei
+
+        now = pd.Timestamp(now_taipei()).tz_localize(None)
+    else:
+        now = pd.Timestamp(now)
+    limit = now + _FUTURE_TOL
+
+    base = pd.Series(pd.to_datetime(list(ts_ns), unit="ns"))
+    candidates = [
+        ("utc-legacy", base + pd.Timedelta(hours=8)),
+        ("taipei-naive", base),
+    ]
+    survivors: list[tuple[str, pd.Series]] = []
+    for name, ser in candidates:
+        if len(ser) and ser.max() > limit:
+            continue
+        if all(_legal_session_time(t) for t in ser.dt.time):
+            survivors.append((name, ser))
+    return survivors
 
 # Volume is a WARNING signal only — NEVER a gate. MXFR1 is a rolling near-month
 # contract, so a historical query returns the *new* contract's (low) volume for
@@ -41,13 +94,17 @@ def fetch_day_session_bar(
     *,
     timeout: int = _KBARS_TIMEOUT,
     volume_warn: int = _VOLUME_WARN,
+    _now=None,
 ) -> dict | None:
     """Authoritative single-day day-session OHLCV from Shioaji 1-min kbars.
 
-    Returns ``{open, high, low, close, volume}``, or ``None`` only when there is
-    no day-session data at all (empty kbars / no bars in 08:45–close). Volume is
-    NOT a gate — a low volume only logs a warning (see ``_VOLUME_WARN``), because
-    rolling-contract historical queries legitimately report low volume.
+    Returns ``{open, high, low, close, volume}``, or ``None`` when there is no
+    day-session data at all (empty kbars / no bars in 08:45–close) OR when the
+    timestamp semantics cannot be structurally determined (fail-loud — a wrong
+    guess writes night values as day closes). Volume is NOT a gate — a low
+    volume only logs a warning (see ``_VOLUME_WARN``), because rolling-contract
+    historical queries legitimately report low volume. ``_now`` is a test seam
+    for the future-timestamp check.
     """
     try:
         kbars = api.kbars(contract, start=str(day), end=str(day), timeout=timeout)
@@ -59,19 +116,47 @@ def fetch_day_session_bar(
     if not kbars or ts is None or len(ts) == 0:
         return None
 
+    variants = _kbars_ts_interpretations(ts, now=_now)
+    if not variants:
+        logger.error(
+            "fetch_day_session_bar: 🔴 %s kbars 時戳語義無法判定 "
+            "(兩種解讀皆含未來或非法時段 bar) — 拒用", day,
+        )
+        return None
+
     raw = pd.DataFrame({
-        "ts": kbars.ts, "open": kbars.Open, "high": kbars.High,
+        "open": kbars.Open, "high": kbars.High,
         "low": kbars.Low, "close": kbars.Close, "volume": kbars.Volume,
     })
-    raw["ts"] = pd.to_datetime(raw["ts"], unit="ns", utc=True).dt.tz_convert("Asia/Taipei")
-    raw = raw.sort_values("ts")
 
     from src.strategy.v2b_engine import _is_settlement_day
     close_cut = _SETTLE_CLOSE if _is_settlement_day(pd.Timestamp(day)) else _DAY_CLOSE
 
-    t = raw["ts"].dt.time
-    mask = (raw["ts"].dt.date == day) & (t >= _DAY_OPEN) & (t < close_cut)
-    sess = raw[mask]
+    picks = []
+    for name, ts_ser in variants:
+        t = ts_ser.dt.time
+        picks.append((name, ts_ser,
+                      (ts_ser.dt.date == day) & (t >= _DAY_OPEN) & (t <= close_cut)))
+    if len(picks) == 2 and bool((picks[0][2] != picks[1][2]).any()):
+        # Both interpretations structurally legal but selecting DIFFERENT rows
+        # as the day session (e.g. a pure 00:00–05:00 night tail that a +8h
+        # shift dresses up as 08:45–13:00 "day" bars) — exactly the bug class
+        # this detector exists for. Never guess.
+        logger.error(
+            "fetch_day_session_bar: 🔴 %s kbars 時戳語義不明確 "
+            "(兩解讀選出不同日盤集合) — 拒用", day,
+        )
+        return None
+    semantics, ts_ser, mask = picks[0]
+    if len(picks) == 2:
+        semantics = "ambiguous-consistent"
+    elif semantics == "taipei-naive":
+        logger.info(
+            "fetch_day_session_bar: %s kbars 時戳判定=台北 naive, 已自動校正 "
+            "(2026-07-25 server 語義切換)", day,
+        )
+    raw["ts"] = ts_ser.values
+    sess = raw[mask.values].sort_values("ts")
     if sess.empty:
         return None
 
@@ -87,6 +172,7 @@ def fetch_day_session_bar(
         # path must check last_ts before treating close as the session close.
         "last_ts": sess.iloc[-1]["ts"].isoformat(),
         "n_bars": int(len(sess)),
+        "ts_semantics": semantics,
     }
     if bar["volume"] < volume_warn:
         logger.warning(

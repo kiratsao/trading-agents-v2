@@ -72,13 +72,28 @@ def main(argv=None) -> int:
         if not kbars or ts is None or len(ts) == 0:
             print("verdict: 🔴 Shioaji kbars 空 — 無資料 (fallback 路徑應接手)")
             return 0
+        from src.data.shioaji_fetcher import _kbars_ts_interpretations
+
+        base = pd.to_datetime(list(kbars.ts), unit="ns")
+        print("\n=== 時戳雙解讀 ===")
+        print(f"utc-legacy(+8) : {base.min() + pd.Timedelta(hours=8)} → "
+              f"{base.max() + pd.Timedelta(hours=8)}")
+        print(f"taipei-naive   : {base.min()} → {base.max()}")
+        variants = _kbars_ts_interpretations(kbars.ts)
+        names = [n for n, _ in variants]
+        print(f"結構偵測存活解讀: {names or '無 — 🔴 語義無法判定'}")
+        if len(variants) == 1:
+            chosen_name, ts_ser = variants[0]
+        else:
+            chosen_name, ts_ser = "taipei-naive(僅供顯示,正式路徑會拒用)", \
+                pd.Series(base)
         raw = pd.DataFrame({
-            "ts": kbars.ts, "open": kbars.Open, "high": kbars.High,
+            "open": kbars.Open, "high": kbars.High,
             "low": kbars.Low, "close": kbars.Close, "volume": kbars.Volume,
         })
-        raw["ts"] = pd.to_datetime(raw["ts"], unit="ns", utc=True) \
-            .dt.tz_convert("Asia/Taipei")
+        raw["ts"] = ts_ser.values
         raw = raw.sort_values("ts")
+        print(f"以下分析採: {chosen_name}")
     finally:
         adapter.logout()
 
@@ -88,9 +103,9 @@ def main(argv=None) -> int:
 
     from datetime import time as _t
     t = raw["ts"].dt.time
-    win = raw[(raw["ts"].dt.date == day) & (t >= _t(8, 45)) & (t < _t(13, 45))]
+    win = raw[(raw["ts"].dt.date == day) & (t >= _t(8, 45)) & (t <= _t(13, 45))]
     out_win = len(raw) - len(win)
-    print(f"日盤窗內 (date=={day}, 08:45–13:45): {len(win)} bars; 窗外 {out_win} bars")
+    print(f"日盤窗內 (date=={day}, 08:45–13:45 含): {len(win)} bars; 窗外 {out_win} bars")
 
     # ── 參考真值 ────────────────────────────────────────────────────────
     tx_day = _taifex_day_bar(day)

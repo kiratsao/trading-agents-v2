@@ -103,6 +103,12 @@ if it's the only failure.
   from.
 - **Business logic time is Asia/Taipei** via `src.utils.tw_time` — never
   bare `datetime.now()` (GCP VM timezone is not guaranteed Taipei).
+- **Shioaji kbars timestamps changed semantics server-side on 2026-07-25**
+  (UTC ns → Taipei-naive ns, decided by query time). Never parse them with a
+  hardcoded `utc=True`; go through `shioaji_fetcher` which detects semantics
+  per response and refuses when undecidable. **Historical backfills must use
+  TAIFEX 一般 only — Shioaji is for the live today-bar.** The day-session
+  aggregation includes the 13:45 closing-auction bar (official close).
 - **The driver builds no notifier and no orchestrator**, so it can't spam
   LINE or touch `data/state_*.json`. Anything that instantiates
   `V2bOrchestrator` or `build_line_notifier()` can.
