@@ -39,6 +39,10 @@ _KBARS_TIMEOUT = 30_000
 # inclusive). Used by the per-response ts-semantics detector: under the CORRECT
 # interpretation 100% of bars fall in these windows; the wrong one puts bars in
 # impossible hours (16:45–21:45, 05:01–08:44, 13:46–14:59).
+# ⚠️ TAIFEX 若調整交易時段 (如 2017 夜盤收盤 03:00→05:00), 必須同步更新這些
+# 常數與 tests/test_kbars_semantics.py — 窗界過時會把偵測器從「拒用」翻成
+# 「鑄造 300 根連續偽日盤」(verifier item-4: 05:00 後 45 分鐘連續成交即可偽造
+# last_ts 13:45 + n_bars≥250 + gap≤5 的完整假日盤; 現行時段產不出此形狀)。
 _NIGHT_OPEN = time(15, 0)
 _NIGHT_CLOSE = time(5, 0)
 _FUTURE_TOL = pd.Timedelta(minutes=2)
@@ -138,9 +142,13 @@ def fetch_day_session_bar(
 
     picks = []
     for name, ts_ser in variants:
-        t = ts_ser.dt.time
+        # Minute-truncated mask, consistent with _legal_session_time: a
+        # 13:45:30-stamped closing auction print must be INCLUDED, not
+        # silently dropped (which would return the 13:44 bar as the close).
+        ts_min = ts_ser.dt.floor("min")
+        t = ts_min.dt.time
         picks.append((name, ts_ser,
-                      (ts_ser.dt.date == day) & (t >= _DAY_OPEN) & (t <= close_cut)))
+                      (ts_min.dt.date == day) & (t >= _DAY_OPEN) & (t <= close_cut)))
     if len(picks) == 2 and bool((picks[0][2] != picks[1][2]).any()):
         # Both interpretations structurally legal but selecting DIFFERENT rows
         # as the day session (e.g. a pure 00:00–05:00 night tail that a +8h

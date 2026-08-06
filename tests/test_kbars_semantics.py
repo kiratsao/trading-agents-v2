@@ -168,6 +168,28 @@ def test_settlement_auction_1330_included(monkeypatch):
     assert bar["close"] == 43_990               # 13:30 結算集合競價含入, 13:35 排除
 
 
+def test_auction_bar_with_seconds_included_as_close():
+    """13:45:30 秒級戳的收盤競價 print 必須含入聚合 (否則 close 靜默錯用
+    13:44 bar — verifier item-5), 且 completeness 接受末根 13:45:30。"""
+    from src.scheduler.orchestrator import _validate_today_bar
+
+    bars = [("2026-08-05 08:45", 44_400, 44_420, 44_380, 44_400, 9_000),
+            ("2026-08-05 13:44", 44_530, 44_540, 44_520, 44_535, 8_000),
+            ("2026-08-05 13:45:30", 44_620, 44_620, 44_620, 44_620, 3_000),
+            ("2026-08-05 22:30", 44_450, 44_460, 44_440, 44_450, 1_500)]
+    bar = fetch_day_session_bar(_Api(_mk(bars, naive=True)), None,
+                                date(2026, 8, 5), _now=_NOW_EOD)
+    assert bar is not None
+    assert bar["close"] == 44_620                      # 競價 bar 是官方 close
+    assert pd.Timestamp(bar["last_ts"]).strftime("%H:%M:%S") == "13:45:30"
+
+    fake = {"close": 44_620.0, "last_ts": "2026-08-05T13:45:30",
+            "n_bars": 300, "max_gap_min": 1.0}
+    with patch("src.data.spot_ref.fetch_spot_close", return_value=44_400.0):
+        meta = _validate_today_bar(fake, date(2026, 8, 5), source="kbars")
+    assert meta["complete"] is True
+
+
 def test_boundary_second_bars_do_not_kill_true_reading():
     """13:45:30 邊界秒數 bar (收盤競價 print) 不得殺掉正確解讀 (分鐘截斷)。"""
     ts = [pd.Timestamp(x).value for x in

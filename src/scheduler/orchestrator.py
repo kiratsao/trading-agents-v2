@@ -1522,7 +1522,7 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
         try:
             ts = pd.Timestamp(bar.get("last_ts"))
             last_kbar = ts.strftime("%H:%M")
-            t = ts.time()
+            t = ts.floor("min").time()  # 13:45:30 收盤競價 print = 13:45
             if _is_settlement_day(pd.Timestamp(today)):
                 in_window = _dtime(13, 25) <= t <= _dtime(13, 30)
             else:
