@@ -168,6 +168,62 @@ def test_settlement_auction_1330_included(monkeypatch):
     assert bar["close"] == 43_990               # 13:30 結算集合競價含入, 13:35 排除
 
 
+def test_boundary_second_bars_do_not_kill_true_reading():
+    """13:45:30 邊界秒數 bar (收盤競價 print) 不得殺掉正確解讀 (分鐘截斷)。"""
+    ts = [pd.Timestamp(x).value for x in
+          ("2026-08-05 08:45", "2026-08-05 13:45:30", "2026-08-05 22:30")]
+    surv = _kbars_ts_interpretations(ts, now=pd.Timestamp("2026-08-05 23:00"))
+    assert [n for n, _ in surv] == ["taipei-naive"]
+
+
+class TestSessionStructureFloor:
+    """Verifier attack (2026-08-06): 單根 05:42 雜散 bar 殺掉正確解讀後,+8 解讀
+    把夜尾偽裝成「末根 13:42」日盤且過 spot band — 但偽造 session 只有 2-3 根。
+    P0 completeness 的 n_bars≥250 + 最大斷流≤5分 是錢關口上的結構防線。"""
+
+    def test_verifier_attack_payload_blocked_at_validation(self):
+        from src.scheduler.orchestrator import _validate_today_bar
+
+        bars = [("2026-08-05 00:45", 44_600, 44_620, 44_580, 44_610, 5_000),
+                ("2026-08-05 04:59", 44_560, 44_570, 44_540, 44_546, 4_000),
+                ("2026-08-05 05:42", 44_552, 44_552, 44_552, 44_552, 80)]
+        bar = fetch_day_session_bar(_Api(_mk(bars, naive=True)), None,
+                                    date(2026, 8, 5),
+                                    _now=pd.Timestamp("2026-08-05 14:30"))
+        # fetcher 層在此退化 payload 可能 wrong-pick (已知限制,雜散 bar 殺掉
+        # 真解讀) — 若回 bar, P0 completeness 必須擋下 (n_bars=3 << 250)。
+        if bar is not None:
+            assert bar["n_bars"] <= 3
+            with patch("src.data.spot_ref.fetch_spot_close",
+                       return_value=44_400.0):
+                meta = _validate_today_bar(dict(bar), date(2026, 8, 5),
+                                           source="kbars")
+            assert meta["complete"] is False
+            assert meta["validated"] is False
+            assert not meta["usable_for_exit"]
+            assert "根" in (meta["reject"] or "")
+
+    def test_forged_sparse_session_with_gap_blocked(self):
+        from src.scheduler.orchestrator import _validate_today_bar
+
+        fake = {"close": 44_552.0, "last_ts": "2026-08-05T13:42:00",
+                "n_bars": 256, "max_gap_min": 42.0}
+        with patch("src.data.spot_ref.fetch_spot_close", return_value=44_400.0):
+            meta = _validate_today_bar(fake, date(2026, 8, 5), source="kbars")
+        assert meta["complete"] is False
+        assert "斷流" in meta["reject"]
+
+    def test_healthy_full_session_passes(self):
+        from src.scheduler.orchestrator import _validate_today_bar
+
+        fake = {"close": 44_526.0, "last_ts": "2026-08-05T13:45:00",
+                "n_bars": 300, "max_gap_min": 1.0}
+        with patch("src.data.spot_ref.fetch_spot_close", return_value=44_400.0):
+            meta = _validate_today_bar(fake, date(2026, 8, 5), source="kbars")
+        assert meta["complete"] is True
+        assert meta["validated"] is True
+
+
 def test_completeness_accepts_1345_auction_bar():
     """日盤聚合含 13:45 後, P0 completeness 窗必須同步接受末根 13:45。"""
     from src.scheduler.orchestrator import _validate_today_bar

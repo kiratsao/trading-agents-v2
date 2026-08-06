@@ -25,7 +25,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 WARN_THRESHOLD = 50.0    # points — surface a ⚠️ but keep the bar
-# Day-session kbar close (13:44 last tick) vs TAIFEX settlement price (incl.
+# Day-session kbar close (13:45 收盤集合競價) vs TAIFEX settlement price (incl.
 # post-close matching) differ structurally by 300-500pt on volatile days
 # (ATR>800), so block only on a genuinely large divergence.
 ALERT_THRESHOLD = 500.0  # points — 🔴 and refuse to persist

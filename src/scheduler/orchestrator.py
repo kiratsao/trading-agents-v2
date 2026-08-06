@@ -43,6 +43,11 @@ _PROXY_AMBIG_BUFFER = 150.0  # pts — |proxy − stop| below this = ambiguous �
 _BASIS_MIN_PAIRS = 5         # min (fut close − spot) samples to trust the basis
 _BASIS_LOOKBACK_BARS = 25    # parquet bars scanned for the rolling basis
 _EQUITY_SANITY_PTS = 600.0   # implied-mark deviation beyond this = stale margin
+# Session-structure completeness floors (kbars path). A real day session is
+# ~300 contiguous 1-min bars (settlement ~286); a night tail dressed up by a
+# wrong ts interpretation is sparse or holed (verifier attack 2026-08-06).
+_MIN_SESSION_BARS = 250
+_MAX_SESSION_GAP_MIN = 5.0
 
 
 class V2bOrchestrator:
@@ -1512,15 +1517,26 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
     close = float(bar["close"])
     last_kbar = None
     complete = False
+    count_ok = gap_ok = True
     if source == "kbars":
         try:
             ts = pd.Timestamp(bar.get("last_ts"))
             last_kbar = ts.strftime("%H:%M")
             t = ts.time()
             if _is_settlement_day(pd.Timestamp(today)):
-                complete = _dtime(13, 25) <= t <= _dtime(13, 30)
+                in_window = _dtime(13, 25) <= t <= _dtime(13, 30)
             else:
-                complete = _dtime(13, 40) <= t <= _dtime(13, 45)
+                in_window = _dtime(13, 40) <= t <= _dtime(13, 45)
+            # Session-structure floor: a real day session is ~300 contiguous
+            # 1-min bars. A wrong ts-interpretation can dress a night tail up
+            # with a forged 13:4x last bar (verifier attack, 2026-08-06), but
+            # it cannot forge ~300 contiguous bars — bar count and largest
+            # gap expose it. Keys absent (legacy/test bars) → checks skipped.
+            n_bars = bar.get("n_bars")
+            max_gap = bar.get("max_gap_min")
+            count_ok = n_bars is None or int(n_bars) >= _MIN_SESSION_BARS
+            gap_ok = max_gap is None or float(max_gap) <= _MAX_SESSION_GAP_MIN
+            complete = bool(in_window and count_ok and gap_ok)
         except (TypeError, ValueError):
             complete = False
 
@@ -1564,6 +1580,10 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
         parts = []
         if night_hit:
             parts.append("close==TAIFEX盤後值(provenance)")
+        if source == "kbars" and not count_ok:
+            parts.append(f"kbars僅{bar.get('n_bars')}根(<{_MIN_SESSION_BARS})")
+        if source == "kbars" and not gap_ok:
+            parts.append(f"kbars斷流{float(bar.get('max_gap_min', 0)):.0f}分")
         if source == "kbars" and not complete:
             parts.append(f"kbars截斷(末根 {last_kbar or '?'})")
         if source == "snapshot":
@@ -1650,13 +1670,13 @@ def _fetch_today_bar_shioaji(simulation: bool = True, broker=None) -> dict | Non
     except Exception as exc:
         logger.warning("_fetch_today_bar_shioaji: kbars failed: %s — trying snapshot", exc)
 
-    # --- Fallback: snapshot (last traded price — may differ from 13:44 close) ---
+    # --- Fallback: snapshot (last traded price — may differ from 13:45 close) ---
     try:
         snap = broker.get_snapshots("MXF")
         close = float(snap["close"])
         logger.warning(
             "_fetch_today_bar_shioaji: using SNAPSHOT fallback  close=%.0f "
-            "(⚠️ may not be 13:44 day-session close)",
+            "(⚠️ may not be 13:45 day-session close)",
             close,
         )
         result = {

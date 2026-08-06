@@ -45,6 +45,10 @@ _FUTURE_TOL = pd.Timedelta(minutes=2)
 
 
 def _legal_session_time(t: time) -> bool:
+    # Minute truncation: a boundary bar stamped 13:45:30 / 05:00:30 is the
+    # closing-auction print, not an illegal minute — second precision would
+    # kill the TRUE interpretation and refuse the whole day (availability).
+    t = time(t.hour, t.minute)
     return (_DAY_OPEN <= t <= _DAY_CLOSE) or t >= _NIGHT_OPEN or t <= _NIGHT_CLOSE
 
 
@@ -172,6 +176,15 @@ def fetch_day_session_bar(
         # path must check last_ts before treating close as the session close.
         "last_ts": sess.iloc[-1]["ts"].isoformat(),
         "n_bars": int(len(sess)),
+        # Largest gap (minutes) between consecutive session bars. A real live
+        # day session is ~300 contiguous 1-min bars; a forged session (night
+        # tail + stray bars dressed up by a wrong ts interpretation) is sparse
+        # or has a large hole before its "13:4x" last bar. Consumed by the P0
+        # completeness gate together with n_bars.
+        "max_gap_min": (
+            float(sess["ts"].diff().dt.total_seconds().max() / 60.0)
+            if len(sess) > 1 else 0.0
+        ),
         "ts_semantics": semantics,
     }
     if bar["volume"] < volume_warn:

@@ -84,7 +84,13 @@ def main() -> int:
         print("     keep the post-aggregation `> yesterday` filter.")
         return 0
 
-    ts = pd.to_datetime(kbars.ts, unit="ns", utc=True).tz_convert("Asia/Taipei")
+    # 2026-07-25 server 語義切換後禁止硬編 utc=True — 用 per-response 偵測
+    from src.data.shioaji_fetcher import _kbars_ts_interpretations
+    _variants = _kbars_ts_interpretations(kbars.ts)
+    if len(_variants) != 1:
+        raise SystemExit(f"🔴 時戳語義無法判定 ({[n for n, _ in _variants]}) — 中止")
+    _name, ts = _variants[0]
+    print(f"(時戳判定: {_name})")
     dates = sorted({t.date() for t in ts})
     print(f"distinct bar dates returned: {dates}")
     if probe in dates:
