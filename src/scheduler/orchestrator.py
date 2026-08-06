@@ -550,6 +550,12 @@ class V2bOrchestrator:
         state.pending_contracts = sig.contracts
         state.pending_signal_date = today_str
         state.pending_reason = sig.reason
+        # The 14:30 gate's ATR, for the 15:05 min-only re-check — stored so the
+        # re-check never re-fetches market data on the pre-order critical path.
+        try:
+            state.pending_atr = float(display_ind.get("atr") or 0.0) or None
+        except (TypeError, ValueError):
+            state.pending_atr = None
         self.state_mgr.save(state)
 
         msg = self._build_decision_message(
@@ -683,9 +689,7 @@ class V2bOrchestrator:
 
         if state.pending_action == "buy" and state.position == 0:
             # 15:05 sizing re-check (裁示 2026-08-05): 只降不升.
-            n_exec = self._execution_sizing_recheck(
-                state, state.pending_contracts, broker=broker,
-            )
+            n_exec = self._execution_sizing_recheck(state, state.pending_contracts)
             result["contracts"] = n_exec
             filled_n = n_exec
             if n_exec <= 0:
@@ -696,6 +700,7 @@ class V2bOrchestrator:
                 logger.warning(msg)
                 self.notify_fn(msg)
                 result["filled"] = 0
+                result["skipped_by_recheck"] = True
             elif broker is not None:
                 order = broker.place_order("MXF", "Buy", n_exec)
                 result["order_id"] = order.get("order_id")
@@ -874,7 +879,7 @@ class V2bOrchestrator:
         elif state.pending_action == "add" and state.position > 0:
             # 15:05 sizing re-check (裁示 2026-08-05): 只降不升, total-based.
             add_n = self._execution_sizing_recheck(
-                state, state.pending_contracts, broker=broker, add_mode=True,
+                state, state.pending_contracts, add_mode=True,
             )
             result["contracts"] = add_n
             old_n = state.position
@@ -886,6 +891,7 @@ class V2bOrchestrator:
                 logger.warning(msg)
                 self.notify_fn(msg)
                 result["add_contracts"] = 0
+                result["skipped_by_recheck"] = True
             elif broker is not None:
                 order = broker.place_order("MXF", "Buy", add_n)
                 result["order_id"] = order.get("order_id")
@@ -930,6 +936,7 @@ class V2bOrchestrator:
         state.pending_signal_date = None
         state.pending_contracts = 0
         state.pending_reason = None
+        state.pending_atr = None
         self.state_mgr.save(state)
 
         # Post-execution verify (15:10 hook): the order has filled and
@@ -941,7 +948,10 @@ class V2bOrchestrator:
         # LINE execution notification
         exec_time = now_taipei().strftime("%H:%M")
         action = result["action"]
-        if action == "buy":
+        if result.get("skipped_by_recheck"):
+            # No order was placed — a "BUY 0×MXF" line would read as a fill.
+            action_desc = "SKIP（15:05 重檢 0口，未下單）"
+        elif action == "buy":
             action_desc = f"BUY {result['contracts']}×MXF @ {exec_price:.0f}"
         elif action == "close":
             pnl = result.get("pnl_twd", 0)
@@ -1206,39 +1216,42 @@ class V2bOrchestrator:
             return {}
 
     def _execution_sizing_recheck(
-        self, state, n_pending: int, *, broker=None, add_mode: bool = False,
+        self, state, n_pending: int, *, add_mode: bool = False,
     ) -> int:
         """15:05 只降不升 sizing re-check (裁示 2026-08-05).
 
         The pending count was gated at 14:30; equity may have moved by 15:05
         (the snapshot is refreshed by ``_persist_live_equity`` before this
-        runs). Recompute the gate with the fresh equity and the same daily ATR
+        runs). Recompute the gate with the fresh equity and the SAME daily ATR
+        (``state.pending_atr``, persisted at 14:30 — no market-data fetch here)
         and take ``min`` — never raise the count. ``add_mode`` gates the TOTAL
         position via ``_max_total_contracts`` (pyramid semantics). Degrades to
-        a no-op (returns the pending count) when data/ATR are unavailable —
-        the 14:30 gate already vetted that count.
+        a no-op (returns the pending count) on any failure — the 14:30 gate
+        already vetted that count.
         """
         if n_pending <= 0:
             return n_pending
         try:
-            df = self._load_data(broker=broker)
-            if df is None or len(df) == 0:
+            # SAME daily ATR as the 14:30 gate, persisted with the pending
+            # intent — the re-check must NEVER touch the market-data stack on
+            # the pre-order critical path (no kbars/TAIFEX/spot fetches, no
+            # 15:05 night-tick ATR contamination). Missing → no-op: the 14:30
+            # gate already vetted this count.
+            atr_v = float(state.pending_atr or 0.0)
+            if atr_v <= 0:
                 return n_pending
-            atr_v = float(self.strategy._compute_indicators(df).iloc[-1]["atr"])
+            if add_mode:
+                max_total = self.strategy._max_total_contracts(state.equity, atr_v)
+                n_re = max(0, max_total - state.position)
+                note = f"total上限 {max_total}口 − 持倉 {state.position}口"
+            else:
+                n_re, note = self.strategy._risk_capped_contracts(
+                    n_pending, state.equity, atr_v,
+                )
+            n_new = min(n_pending, n_re)
         except Exception as exc:
             logger.warning("15:05 重檢不可用 (%s) — 沿用 14:30 口數", exc)
             return n_pending
-        if atr_v <= 0:
-            return n_pending
-        if add_mode:
-            max_total = self.strategy._max_total_contracts(state.equity, atr_v)
-            n_re = max(0, max_total - state.position)
-            note = f"total上限 {max_total}口 − 持倉 {state.position}口"
-        else:
-            n_re, note = self.strategy._risk_capped_contracts(
-                n_pending, state.equity, atr_v,
-            )
-        n_new = min(n_pending, n_re)
         if n_new < n_pending:
             label = "加碼" if add_mode else "進場"
             self.notify_fn(
@@ -1479,8 +1492,9 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
     (a) Completeness — kbars only: the LAST session kbar must fall in
         13:40–13:45 (settlement day: 13:25–13:30). A feed that died mid-morning
         yields a truncated "close" that must never be treated as the day close.
-    (b) Spot gate — both paths: |close − ^TWII spot| ≤ _BASIS_BAND (the spot
-        index has no night session, so it is night-proof truth).
+    (b) Spot gate — both paths: |close − ^TWII spot| ≤ max(500, 1.6%×spot)
+        (``basis_band_for``; the spot index has no night session, so it is
+        night-proof truth).
 
     Returns a meta dict:
       validated       — passed BOTH checks → may be labeled 台指收盤, entries OK

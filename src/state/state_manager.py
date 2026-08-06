@@ -85,6 +85,10 @@ class TradingState:
     pending_contracts: int = 0
     pending_signal_date: str | None = None
     pending_reason: str | None = None
+    # ATR used by the 14:30 gate — consumed ONLY together with a same-day
+    # pending_action by the 15:05 sizing re-check, so the re-check uses the
+    # exact same daily ATR with zero extra market-data fetches.
+    pending_atr: float | None = None
 
 
 class StateManager:
@@ -158,6 +162,7 @@ class StateManager:
             pending_contracts=int(s.get("pending_contracts", 0)),
             pending_signal_date=s.get("pending_signal_date"),
             pending_reason=s.get("pending_reason"),
+            pending_atr=s.get("pending_atr"),
         )
 
     def save(self, state: TradingState) -> None:
