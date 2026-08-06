@@ -24,10 +24,22 @@ logger = logging.getLogger(__name__)
 
 _CACHE = Path(__file__).resolve().parent.parent.parent / "data" / "spot_cache.json"
 _TIMEOUT = 8  # seconds — keep the daemon path from hanging on a slow yfinance
-# |MXF day close − spot| plausible band. Day closes sat 26–330pt from spot across
-# 2026; night values diverged 193–2,043. Beyond this a value is treated as "not a
-# day value" (night/anomaly). Kept generous so a large legit basis never fails.
+# |MXF day close − spot| plausible band FLOOR. Basis grows with index level —
+# the flat 500 false-tripped 9 legitimate days in 2026 alone (index 37k+), incl.
+# the legit 2026-07-31 +3,402pt day bar (basis 559). Night values diverge
+# ≥~2,000pt (large class) or are caught by provenance (small-gap class), so a
+# relative band costs no night coverage. 裁示 2026-08-05: max(500, 1.6%×spot) —
+# 0 false trips over all 1,580 spot-days 2020→2026. (0.3×ATR was evaluated and
+# rejected: it never exceeds 500 → no-op.) Use basis_band_for(), not the raw floor.
 _BASIS_BAND = 500.0
+_BASIS_PCT = 0.016
+
+
+def basis_band_for(spot: float | None) -> float:
+    """Spot-validation band for a given spot level: max(500, 1.6% × spot)."""
+    if spot is None or spot <= 0:
+        return _BASIS_BAND
+    return max(_BASIS_BAND, _BASIS_PCT * float(spot))
 # TAIFEX 一般 and the Shioaji day oracle measure the same MXF day close; within
 # this they are a consensus.
 _AGREE_TOL = 40.0
@@ -116,7 +128,7 @@ def resolve_day_close(
     taifex: float | None = None,
     shioaji: float | None = None,
     spot: float | None = None,
-    basis_band: float = _BASIS_BAND,
+    basis_band: float | None = None,
 ) -> tuple[float | None, str]:
     """Return (day_close, detail) or (None, reason) for *day*.
 
@@ -146,7 +158,8 @@ def resolve_day_close(
         k, v = next(iter(mxf.items()))
         return v, f"no-spot; single source {k}={v:.0f} (unverified)"
 
-    within = {k: v for k, v in mxf.items() if abs(v - spot) <= basis_band}
+    band = basis_band if basis_band is not None else basis_band_for(spot)
+    within = {k: v for k, v in mxf.items() if abs(v - spot) <= band}
     if not within:
         cand = ", ".join(f"{k}={v:.0f}(Δ{v - spot:+.0f})" for k, v in mxf.items())
         return None, f"all MXF far from spot {spot:.0f} [{cand}] — night/anomaly, fail-loud"

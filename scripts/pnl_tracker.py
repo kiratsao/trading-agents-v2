@@ -164,6 +164,16 @@ def track_pnl() -> dict | None:
     if total_capital <= 0:
         return None
 
+    # equity=0 means BOTH sources failed (broker query + state file) — feeding
+    # 0 into the split math fabricates a "total loss" report (each investor
+    # shown −100%) that daily_health_check would push to LINE. Abort loudly.
+    if equity <= 0:
+        print(
+            "🔴 pnl_tracker: 淨值不可得 (broker 查詢失敗且 state 檔缺失/為 0) — "
+            "跳過分帳，避免偽報全員虧損"
+        )
+        return None
+
     names = {inv["name"] for inv in investors}
     withdrawn = cumulative_withdrawals(cfg, names)
     total_withdrawn = sum(withdrawn.values())

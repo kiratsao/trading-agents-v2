@@ -599,13 +599,13 @@ def _spot_flags_bar(day: date, close: float) -> bool:
     unavailable, so a yfinance outage never blanket-rejects.
     """
     try:
-        from src.data.spot_ref import _BASIS_BAND, fetch_spot_close
+        from src.data.spot_ref import basis_band_for, fetch_spot_close
 
         spot = fetch_spot_close(day)
     except Exception as exc:
         logger.debug("_spot_flags_bar: spot unavailable for %s (%s)", day, exc)
         return False
-    return spot is not None and abs(close - spot) > _BASIS_BAND
+    return spot is not None and abs(close - spot) > basis_band_for(spot)
 
 
 def _rescue_divergent_bar(

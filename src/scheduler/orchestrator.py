@@ -682,14 +682,27 @@ class V2bOrchestrator:
         COST_PER_SIDE, TICK_VALUE = _load_execution_constants()
 
         if state.pending_action == "buy" and state.position == 0:
-            filled_n = state.pending_contracts
-            if broker is not None:
-                order = broker.place_order("MXF", "Buy", state.pending_contracts)
+            # 15:05 sizing re-check (裁示 2026-08-05): 只降不升.
+            n_exec = self._execution_sizing_recheck(
+                state, state.pending_contracts, broker=broker,
+            )
+            result["contracts"] = n_exec
+            filled_n = n_exec
+            if n_exec <= 0:
+                msg = (
+                    f"⚠️ 15:05 重檢 0口可進 — 跳過進場 "
+                    f"(14:30 pending {state.pending_contracts}口)"
+                )
+                logger.warning(msg)
+                self.notify_fn(msg)
+                result["filled"] = 0
+            elif broker is not None:
+                order = broker.place_order("MXF", "Buy", n_exec)
                 result["order_id"] = order.get("order_id")
                 exec_price = order.get("fill_price", exec_price)
                 # Source of truth = broker actual, NOT the requested quantity.
                 actual = _sync_position_from_broker(
-                    broker, "MXF", state.pending_contracts, self.notify_fn,
+                    broker, "MXF", n_exec, self.notify_fn,
                 )
                 filled_n = actual if actual is not None else 0
             if filled_n > 0:
@@ -699,9 +712,9 @@ class V2bOrchestrator:
                 state.contracts = filled_n
                 state.highest_high = exec_price
                 state.entry_date = today_taipei().isoformat()
-            else:
+            elif n_exec > 0:
                 msg = (
-                    f"🔴 進場未成交: Buy {state.pending_contracts}口 IOC 未成交，維持空倉"
+                    f"🔴 進場未成交: Buy {n_exec}口 IOC 未成交，維持空倉"
                 )
                 logger.warning(msg)
                 self.notify_fn(msg)
@@ -859,9 +872,21 @@ class V2bOrchestrator:
                 result["rollover_reason"] = "sell order failed — rollover aborted"
 
         elif state.pending_action == "add" and state.position > 0:
-            add_n = state.pending_contracts
+            # 15:05 sizing re-check (裁示 2026-08-05): 只降不升, total-based.
+            add_n = self._execution_sizing_recheck(
+                state, state.pending_contracts, broker=broker, add_mode=True,
+            )
+            result["contracts"] = add_n
             old_n = state.position
-            if broker is not None:
+            if add_n <= 0:
+                msg = (
+                    f"⚠️ 15:05 重檢 0口可加 — 跳過加碼 "
+                    f"(14:30 pending {state.pending_contracts}口, 持倉 {old_n}口)"
+                )
+                logger.warning(msg)
+                self.notify_fn(msg)
+                result["add_contracts"] = 0
+            elif broker is not None:
                 order = broker.place_order("MXF", "Buy", add_n)
                 result["order_id"] = order.get("order_id")
                 exec_price = order.get("fill_price", exec_price)
@@ -1180,6 +1205,48 @@ class V2bOrchestrator:
             logger.warning("_compute_display_indicators failed: %s", exc)
             return {}
 
+    def _execution_sizing_recheck(
+        self, state, n_pending: int, *, broker=None, add_mode: bool = False,
+    ) -> int:
+        """15:05 只降不升 sizing re-check (裁示 2026-08-05).
+
+        The pending count was gated at 14:30; equity may have moved by 15:05
+        (the snapshot is refreshed by ``_persist_live_equity`` before this
+        runs). Recompute the gate with the fresh equity and the same daily ATR
+        and take ``min`` — never raise the count. ``add_mode`` gates the TOTAL
+        position via ``_max_total_contracts`` (pyramid semantics). Degrades to
+        a no-op (returns the pending count) when data/ATR are unavailable —
+        the 14:30 gate already vetted that count.
+        """
+        if n_pending <= 0:
+            return n_pending
+        try:
+            df = self._load_data(broker=broker)
+            if df is None or len(df) == 0:
+                return n_pending
+            atr_v = float(self.strategy._compute_indicators(df).iloc[-1]["atr"])
+        except Exception as exc:
+            logger.warning("15:05 重檢不可用 (%s) — 沿用 14:30 口數", exc)
+            return n_pending
+        if atr_v <= 0:
+            return n_pending
+        if add_mode:
+            max_total = self.strategy._max_total_contracts(state.equity, atr_v)
+            n_re = max(0, max_total - state.position)
+            note = f"total上限 {max_total}口 − 持倉 {state.position}口"
+        else:
+            n_re, note = self.strategy._risk_capped_contracts(
+                n_pending, state.equity, atr_v,
+            )
+        n_new = min(n_pending, n_re)
+        if n_new < n_pending:
+            label = "加碼" if add_mode else "進場"
+            self.notify_fn(
+                f"⚠️ 15:05 重檢降口數({label}): {n_pending}→{n_new}口 — "
+                f"{note or 'risk-cap'}; 15:05 淨值 {state.equity:,.0f}"
+            )
+        return n_new
+
     def _build_decision_message(
         self,
         sig,
@@ -1443,12 +1510,15 @@ def _validate_today_bar(bar: dict, today, source: str) -> dict:
     spot = spot_dev = None
     spot_ok: bool | None = None
     try:
-        from src.data.spot_ref import _BASIS_BAND, fetch_spot_close
+        from src.data.spot_ref import basis_band_for, fetch_spot_close
 
         spot = fetch_spot_close(today)
         if spot is not None:
             spot_dev = close - spot
-            spot_ok = abs(spot_dev) <= _BASIS_BAND
+            # 裁示 2026-08-05: relative band max(500, 1.6%×spot) — the flat 500
+            # rejected legitimate big-move day bars at 2026 index levels
+            # (7/31: legit +3,402pt day, basis 559).
+            spot_ok = abs(spot_dev) <= basis_band_for(spot)
     except Exception as exc:
         logger.warning("_validate_today_bar: spot gate unavailable (%s)", exc)
 

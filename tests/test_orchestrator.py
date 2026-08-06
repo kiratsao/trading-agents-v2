@@ -409,6 +409,10 @@ class TestAddEntryPriceReconcile:
         # so the signal_override is irrelevant; pass a placeholder.
         orch, _ = _make_orch(state, Signal("hold", 0, ""))
         broker = MagicMock()
+        # get_account must return a real dict: a bare MagicMock float()s to 1.0
+        # and _persist_live_equity would stamp equity=1.0 as「即時」, which the
+        # 15:05 sizing re-check (裁示 2026-08-05) would then gate to 0口.
+        broker.get_account.return_value = {"equity": 2_000_000.0}
         broker.place_order.return_value = {
             "order_id": "ADD-N", "fill_price": 42_415.0,
         }

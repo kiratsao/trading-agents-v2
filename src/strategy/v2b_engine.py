@@ -246,6 +246,27 @@ class V2bEngine:
                 n = n_buf
         return max(0, n), "; ".join(note_parts)
 
+    def _max_total_contracts(self, equity: float, atr_v: float) -> int:
+        """Ceiling on the TOTAL position: margin(+buffer) floor, config hard
+        cap, and risk-cap on total stop risk. Shared by pyramid adds (above)
+        and the orchestrator's 15:05 execution re-check.
+
+        margin_buffer_atr added to the add-path 2026-08-06 (裁示): adds
+        previously used the plain margin floor only, so a buffered account
+        could pyramid into the buffer it reserved at entry."""
+        import math as _math
+
+        _margin = self.margin_per_contract or _MTX_MARGIN
+        denom = _margin + (self.margin_buffer_atr or 0.0) * atr_v * self.point_value
+        max_total = max(1, _math.floor(equity / denom)) if denom > 0 else 1
+        if self.max_contracts is not None and self.max_contracts > 0:
+            max_total = min(max_total, self.max_contracts)
+        if self.risk_cap_pct and atr_v > 0:
+            risk_per = self.trail_atr_mult * atr_v * self.point_value
+            if risk_per > 0:
+                max_total = min(max_total, int(equity * self.risk_cap_pct // risk_per))
+        return max_total
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -358,23 +379,9 @@ class V2bEngine:
             float_profit = close - entry_price
             add_threshold = self.pyramid_atr_mult * atr_v
             if float_profit >= add_threshold:
-                import math as _math
                 add_n = max(1, round((contracts or current_position) * self.pyramid_size_fraction))
-                # Margin safety cap: total position must not exceed floor(equity / margin)
                 cur_contracts = contracts or current_position
-                _margin = self.margin_per_contract or _MTX_MARGIN
-                max_total = max(1, _math.floor(equity / _margin))
-                # Hard ceiling from config
-                if self.max_contracts is not None and self.max_contracts > 0:
-                    max_total = min(max_total, self.max_contracts)
-                # Risk-cap gate applies to the TOTAL position on adds too
-                if self.risk_cap_pct:
-                    risk_per = self.trail_atr_mult * atr_v * self.point_value
-                    if risk_per > 0:
-                        max_total = min(
-                            max_total,
-                            int(equity * self.risk_cap_pct // risk_per),
-                        )
+                max_total = self._max_total_contracts(equity, atr_v)
                 add_n = min(add_n, max(0, max_total - cur_contracts))
                 if add_n <= 0:
                     return Signal(
