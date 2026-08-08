@@ -248,3 +248,71 @@ class TestCalendarGuard:
                                    validate_fn=lambda day, close: ("ok", []))
         assert res["success"] is True
         assert res["latest_date"] == "2026-07-09"
+
+
+class TestIndependentCrossCheck:
+    """回補源 = TAIFEX ⇒ validate 的 TAIFEX oracle 循環;Shioaji day-session 是
+    唯一真正獨立的比對。ALERT-ONLY: 分歧只告警,絕不改值、絕不阻擋寫入
+    (2026-08-08 裁示 1(b))。"""
+
+    @staticmethod
+    def _sj(day: str, close: float):
+        return pd.DataFrame(
+            [{"open": close, "high": close, "low": close, "close": close,
+              "volume": 150_000}],
+            index=pd.DatetimeIndex([pd.Timestamp(day)], name="date"),
+        )
+
+    def test_divergence_alerts_without_changing_value(self, monkeypatch):
+        monkeypatch.setattr("src.data.shioaji_fetcher.fetch_via_env",
+                            lambda s, e, product="MXF": self._sj("2026-08-05",
+                                                                 44_100.0))
+        notes: list[str] = []
+        daily_updater._independent_cross_check(
+            date(2026, 8, 5), 44_526.0, notes.append)
+        assert len(notes) == 1
+        assert notes[0].startswith("🔴")
+        assert "值未變更" in notes[0] and "Δ+426pt" in notes[0]
+
+    def test_agreement_is_silent(self, monkeypatch):
+        monkeypatch.setattr("src.data.shioaji_fetcher.fetch_via_env",
+                            lambda s, e, product="MXF": self._sj("2026-08-05",
+                                                                 44_526.0))
+        notes: list[str] = []
+        daily_updater._independent_cross_check(
+            date(2026, 8, 5), 44_526.0, notes.append)
+        assert notes == []
+
+    def test_no_creds_degrades_silently(self, monkeypatch):
+        def _boom(s, e, product="MXF"):
+            raise RuntimeError("SHIOAJI_API_KEY not set")
+
+        monkeypatch.setattr("src.data.shioaji_fetcher.fetch_via_env", _boom)
+        notes: list[str] = []
+        daily_updater._independent_cross_check(
+            date(2026, 8, 5), 44_526.0, notes.append)
+        assert notes == []          # 無 creds 環境不得天天發 LINE
+
+    def test_gap_fill_runs_the_check(self, monkeypatch, tmp_path):
+        """gap-fill 路徑原本完全無 cross-validation — 現在至少會告警。"""
+        monkeypatch.setattr("src.data.shioaji_fetcher.fetch_via_env",
+                            lambda s, e, product="MXF": self._sj("2026-07-09",
+                                                                 44_000.0))
+        idx = pd.DatetimeIndex([pd.Timestamp("2026-07-07")], name="date")
+        seed = pd.DataFrame(
+            [{"open": 45_759.0, "high": 45_759.0, "low": 45_759.0,
+              "close": 45_759.0, "volume": 150_000}], index=idx)
+        pq = tmp_path / "MXF.parquet"
+        seed.to_parquet(pq)
+        notes: list[str] = []
+        filled, _ = daily_updater._detect_and_fill_gaps(
+            seed, pq, notes.append, date(2026, 7, 9),
+            _fetch_override=lambda s, e: (
+                _bar("2026-07-09", 45_681.0) if s == date(2026, 7, 9) else None
+            ),
+        )
+        assert filled == 1
+        assert any("獨立交叉檢查分歧" in n for n in notes)
+        # 值不得被改動
+        out = pd.read_parquet(pq)
+        assert abs(float(out.loc[pd.Timestamp("2026-07-09"), "close"]) - 45_681.0) < 1

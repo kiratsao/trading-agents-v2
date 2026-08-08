@@ -119,3 +119,20 @@ Strategy: EMA(30/100), CD2, ATR×2.0 trailing, ADX(14)>25, Anti-Martingale, sett
   (`reconcile_state_with_broker`)；手動同步用 `scripts/sync_state.py --apply`
 - **假日表** (`tw_holidays._ANNUAL_HOLIDAYS`) 每年 12 月依期交所公告追加隔年；
   颱風停市日事後補入；可用 parquet 實測稽核（表=交易日但無 bar ⇒ 表錯）
+
+## 已知限制 (Known limitations)
+
+- **回補 oracle 循環**：回補源為 TAIFEX 一般（2026-08-08 起），而
+  `validation.validate_latest_bar` 的 TAIFEX oracle 是同一來源 ⇒ 對
+  TAIFEX-primary bar **trivially 同意**（Δ0，非真驗證）。真正獨立的檢查只剩
+  (a) Shioaji day-session oracle — **需要 .env creds，無 creds 環境完全消失**；
+  (b) spot band `max(500, 1.6%×spot)` ≈ 700pt @44k — 擋得住夜值/大異常，
+  **擋不住 TAIFEX 自身的小幅錯值**。GCP 生產有 creds ⇒ (a) 有效；本機/CI 無。
+- **`_detect_and_fill_gaps` 寫入不經 cross-validation**（不收 validate_fn）；
+  `update()` 5b 只驗**最新一根**。多日回補的中間日僅受 calendar guard +
+  provenance + spot 保護。`ensure_parquet_fresh` 則逐日驗。
+- **session 窗界硬編**（`shioaji_fetcher._DAY_OPEN/_DAY_CLOSE/_NIGHT_OPEN/
+  _NIGHT_CLOSE`）：TAIFEX 調整交易時段時**必須同步更新**，否則時戳語義偵測器
+  會從「拒用」翻成「鑄造偽日盤」（見該檔警示註解）
+- **band 邊界餘裕**：任何 band 參數變更後必須重跑
+  `python scripts/band_margin_report.py`（最緊案例 2026-06-01 僅餘 ~11pt）

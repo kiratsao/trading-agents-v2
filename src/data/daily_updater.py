@@ -469,6 +469,10 @@ def _detect_and_fill_gaps(
         filled += 1
         logger.info("daily_updater: back-filled %s", d)
         notify_fn(f"✅ {d.isoformat()} 日K補回成功")
+        # This path has NO cross-source validation (unlike update() 5b /
+        # ensure_parquet_fresh) — run the alert-only independent check so a
+        # divergent back-filled bar is at least visible. Never overwrites.
+        _independent_cross_check(d, float(bar["close"].iloc[-1]), notify_fn)
 
     return filled, still_missing
 
@@ -487,6 +491,49 @@ def _taifex_day_bar(day: date) -> pd.DataFrame | None:
         return None
     ts = pd.Timestamp(day)
     return tx.loc[[ts]] if ts in tx.index else None
+
+
+# TAIFEX 一般 close vs Shioaji day-session close 的告警門檻。兩者量的是同一個
+# 收盤價 (自 13:45 收盤集合競價 bar 納入聚合後,2026-08-07 實測逐位相同),故
+# 門檻可遠低於 spot band (~700pt);設 100pt 容忍 tick/撮合噪音,又能抓到
+# TAIFEX 暫定值/修正這類「小到 spot band 看不見」的分歧。ALERT-ONLY。
+_XCHECK_TOL = 100.0
+
+
+def _independent_cross_check(day: date, close: float, notify_fn) -> None:
+    """Alert-only 獨立交叉檢查 — **絕不改變寫入決策、絕不覆蓋值**。
+
+    回補源改 TAIFEX-primary 後,``validate_latest_bar`` 的 TAIFEX oracle 與
+    來源同源 ⇒ trivially 同意 (循環)。真正獨立的只剩 Shioaji day-session
+    (經時戳語義偵測) 與 spot band;後者 ~700pt 擋不住 TAIFEX 自身的小幅錯值。
+    此函式補上前者,並在無 creds / 無資料時明說「本 bar 無獨立驗證」(僅 log,
+    不發 LINE — 無 creds 環境會天天觸發)。
+    """
+    try:
+        from src.data.shioaji_fetcher import fetch_via_env
+
+        sj = fetch_via_env(day, day, product="MXF")
+    except Exception as exc:
+        logger.info("cross-check %s: Shioaji 不可用 (%s) — 本 bar 無獨立驗證",
+                    day, exc)
+        return
+    ts = pd.Timestamp(day)
+    if sj is None or sj.empty or ts not in pd.DatetimeIndex(sj.index).normalize():
+        logger.info("cross-check %s: Shioaji 無日盤資料 — 本 bar 無獨立驗證", day)
+        return
+    sj_close = float(sj.loc[ts, "close"])
+    dev = close - sj_close
+    if abs(dev) > _XCHECK_TOL:
+        msg = (
+            f"🔴 {day.isoformat()} 獨立交叉檢查分歧: 已寫入 {close:,.0f} vs "
+            f"Shioaji 日盤 {sj_close:,.0f} (Δ{dev:+,.0f}pt) — **值未變更**,"
+            f"請人工確認 (TAIFEX 暫定值/事後修正?)"
+        )
+        logger.error(msg)
+        notify_fn(msg)
+    else:
+        logger.info("cross-check %s: TAIFEX %.0f vs Shioaji %.0f (Δ%+.0f) ✅",
+                    day, close, sj_close, dev)
 
 
 def _taifex_confirms_day(day: date) -> bool | None:

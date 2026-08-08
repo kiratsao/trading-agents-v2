@@ -72,6 +72,32 @@ live equity:
 Backtest with different params: edit nothing — use the one-liner from
 `CLAUDE.md` (Development Commands) with `.venv/bin/python`.
 
+## Deploy (GCP production)
+
+The daemon runs on a GCP VM (system `python3`, no venv) under systemd. The
+operator deploys; an agent's job is to hand over this exact sequence.
+**Never leave the config in a half-updated state**: back up first, then chain
+`checkout` and `pull` with `&&` so `accounts.yaml` cannot sit at stale values
+between the two, then assert the live values immediately.
+
+```bash
+cd ~/trading-agents-v2
+git diff config/accounts.yaml                      # inspect local drift FIRST
+cp config/accounts.yaml /tmp/accounts.yaml.bak     # keep the running config
+git checkout -- config/accounts.yaml && git pull   # chained — no gap
+grep -E "risk_cap_pct|margin_buffer_atr|max_contracts" config/accounts.yaml
+find . -name __pycache__ -type d -exec rm -rf {} + # stale bytecode caused a
+                                                   # real incident — never skip
+python3 -m pytest tests/ -q                        # sanity before restart
+sudo systemctl restart trading-agents-v2           # AVOID the 14:10–15:10 window
+sleep 120 && systemctl is-active trading-agents-v2 # a fast restart once
+                                                   # ABRT'd the Shioaji C ext;
+                                                   # systemd recovered in 60s
+```
+
+Timers pick up new code on their next fire without a restart (fresh process);
+only the long-lived daemon needs one.
+
 ## Run (human path — production only)
 
 `python -m src.scheduler.main --live` starts the APScheduler daemon
