@@ -93,6 +93,19 @@ def fetch_taifex_day_session_range(start: date, end: date) -> pd.DataFrame | Non
         df = fetch_taifex_month(y, m, product="MTX")
         if df is not None and not df.empty:
             frames.append(df)
+        else:
+            # A month that returns NOTHING is a transient TAIFEX/network hole,
+            # not "no trading days" — 2026-02 came back empty on one build and
+            # was byte-identical before and after (2026-08-08 study). Silently
+            # skipping it makes the ORACLE vanish exactly when the same source
+            # is also the primary. Callers still degrade safely (missing days →
+            # Shioaji fallback + ⚠️, or calendar guard refuse+retry), but the
+            # hole must be visible in the log.
+            logger.warning(
+                "fetch_taifex_day_session_range: %04d-%02d 回傳空 — TAIFEX 暫時性"
+                " 缺漏 (非無交易日); 該月 oracle/來源本次不可用",
+                y, m,
+            )
         m += 1
         if m > 12:
             m, y = 1, y + 1

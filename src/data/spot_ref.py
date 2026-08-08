@@ -25,12 +25,15 @@ logger = logging.getLogger(__name__)
 _CACHE = Path(__file__).resolve().parent.parent.parent / "data" / "spot_cache.json"
 _TIMEOUT = 8  # seconds — keep the daemon path from hanging on a slow yfinance
 # |MXF day close − spot| plausible band FLOOR. Basis grows with index level —
-# the flat 500 false-tripped 9 legitimate days in 2026 alone (index 37k+), incl.
-# the legit 2026-07-31 +3,402pt day bar (basis 559). Night values diverge
+# the flat 500 false-tripped 10 legitimate days in 2026 alone (index 37k+): 9 up
+# to 2026-07-30 plus the legit 2026-07-31 +3,402pt day bar (basis 559). Night
+# values diverge
 # ≥~2,000pt (large class) or are caught by provenance (small-gap class), so a
 # relative band costs no night coverage. 裁示 2026-08-05: max(500, 1.6%×spot) —
-# 0 false trips over all 1,580 spot-days 2020→2026. (0.3×ATR was evaluated and
-# rejected: it never exceeds 500 → no-op.) Use basis_band_for(), not the raw floor.
+# 0 false trips over all spot-days 2020→2026. (0.3×ATR was evaluated and
+# rejected: it never exceeds 500 → no-op.) Use basis_band_for(), not the raw
+# floor. 邊界極窄 — 最緊 11.3pt (2026-06-01): 改動任何 band 參數後**必須**重跑
+# ``python scripts/band_margin_report.py`` (誤觸即 exit 1)。
 _BASIS_BAND = 500.0
 _BASIS_PCT = 0.016
 
