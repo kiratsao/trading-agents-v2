@@ -31,10 +31,33 @@ START_MONTH = 1
 
 _TAIFEX_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
 
+# Short-TTL month-CSV cache. One update cycle hits the same month file up to
+# 4× (TAIFEX primary + calendar guard + validate oracle + night provenance);
+# serving them the SAME bytes both saves 3 downloads and makes the cycle
+# internally CONSISTENT — the rescue/guard can no longer disagree with the
+# primary because a second download raced a TAIFEX-side update (verifier
+# finding 2026-08-08). TTL keeps a long-lived daemon fresh across cycles.
+_CSV_CACHE: dict[tuple[int, int, str], tuple[float, str]] = {}
+_CSV_TTL_S = 600.0
+
+
+def _csv_cache_clear() -> None:
+    _CSV_CACHE.clear()
+
 
 def _download_taifex_csv(year: int, month: int, product: str = "MTX") -> str:
-    """POST to TAIFEX futDataDown and return the decoded (big5) CSV body."""
+    """POST to TAIFEX futDataDown and return the decoded (big5) CSV body.
+
+    Cached per (year, month, product) for ``_CSV_TTL_S`` seconds — see
+    ``_CSV_CACHE`` above. Failures are never cached.
+    """
     import calendar
+    import time as _time
+
+    key = (year, month, product)
+    hit = _CSV_CACHE.get(key)
+    if hit is not None and _time.monotonic() - hit[0] < _CSV_TTL_S:
+        return hit[1]
 
     last_day = calendar.monthrange(year, month)[1]
     start_date = f"{year}/{month:02d}/01"
@@ -55,7 +78,9 @@ def _download_taifex_csv(year: int, month: int, product: str = "MTX") -> str:
     )
 
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("big5", errors="replace")
+        body = resp.read().decode("big5", errors="replace")
+    _CSV_CACHE[key] = (_time.monotonic(), body)
+    return body
 
 
 def _parse_taifex_csv(
