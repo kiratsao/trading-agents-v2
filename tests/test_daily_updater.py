@@ -22,60 +22,88 @@ def _one_day_frame(day: str, close: float) -> pd.DataFrame:
     return df
 
 
-class TestTaifexFallback:
-    """Task 1: when Shioaji has no day-session data (2026-06-01 class), the
-    fetch must fall back to TAIFEX and loudly flag the missing cross-validation.
-    """
+class TestTaifexPrimary:
+    """2026-08-08 裁示: 過去日回補以 TAIFEX 一般 為主源 (updater 只寫已完結日,
+    TAIFEX 官方日檔即 canonical 真值; kbars 時戳語義事故後 Shioaji 僅當日
+    live bar)。Shioaji 降為 TAIFEX 缺日時的 fallback,寫入前仍受 calendar
+    guard 與 5b 交叉驗證約束 (TAIFEX 恆為最終贏家)。"""
 
-    def test_shioaji_empty_falls_back_to_taifex(self):
-        notes: list[str] = []
-        d = date(2026, 6, 1)
+    def test_taifex_primary_wins_over_shioaji(self):
+        d = date(2026, 6, 2)
         with (
-            patch("src.data.shioaji_fetcher.fetch_via_env",
-                  return_value=pd.DataFrame()),
             patch("src.data.validation.fetch_taifex_day_session_range",
-                  return_value=_one_day_frame("2026-06-01", 45055.0)) as mock_tx,
-        ):
-            out = _fetch_and_aggregate(d, d, notify_fn=notes.append)
-
-        assert out is not None and not out.empty
-        assert float(out["close"].iloc[-1]) == 45055.0
-        mock_tx.assert_called_once_with(d, d)
-        # Must surface that the bar is unvalidated (user requirement).
-        assert any("TAIFEX" in m and "無獨立交叉驗證" in m for m in notes), notes
-
-    def test_shioaji_exception_falls_back_to_taifex(self):
-        d = date(2026, 6, 1)
-        with (
+                  return_value=_one_day_frame("2026-06-02", 45055.0)) as mock_tx,
             patch("src.data.shioaji_fetcher.fetch_via_env",
-                  side_effect=RuntimeError("creds missing")),
-            patch("src.data.validation.fetch_taifex_day_session_range",
-                  return_value=_one_day_frame("2026-06-01", 45055.0)),
+                  return_value=_one_day_frame("2026-06-02", 44900.0)) as mock_sj,
         ):
             out = _fetch_and_aggregate(d, d)
         assert out is not None and float(out["close"].iloc[-1]) == 45055.0
+        mock_tx.assert_called_once_with(d, d)
+        mock_sj.assert_not_called()          # TAIFEX 齊全 → 不打 Shioaji
 
-    def test_shioaji_present_skips_taifex(self):
-        # Healthy path: a present Shioaji bar is used as-is; TAIFEX is only a
-        # fallback/rescue (the latter fires downstream, at the validation ALERT
-        # in update()/ensure_parquet_fresh — see test_updater_taifex_guard).
+    def test_taifex_missing_falls_back_to_shioaji_with_alert(self):
+        notes: list[str] = []
         d = date(2026, 6, 2)
         with (
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=None),
             patch("src.data.shioaji_fetcher.fetch_via_env",
                   return_value=_one_day_frame("2026-06-02", 44900.0)),
-            patch("src.data.validation.fetch_taifex_day_session_range") as mock_tx,
+        ):
+            out = _fetch_and_aggregate(d, d, notify_fn=notes.append)
+        assert out is not None and float(out["close"].iloc[-1]) == 44900.0
+        assert any("退回 Shioaji" in m for m in notes), notes
+
+    def test_taifex_exception_falls_back(self):
+        d = date(2026, 6, 2)
+        with (
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  side_effect=RuntimeError("TAIFEX down")),
+            patch("src.data.shioaji_fetcher.fetch_via_env",
+                  return_value=_one_day_frame("2026-06-02", 44900.0)),
         ):
             out = _fetch_and_aggregate(d, d)
         assert out is not None and float(out["close"].iloc[-1]) == 44900.0
-        mock_tx.assert_not_called()
+
+    def test_partial_range_merges_without_override(self):
+        """6/1 TAIFEX 有、6/2 缺 → 6/2 由 Shioaji 補; 6/1 保 TAIFEX 值
+        (Shioaji 給了不同的 6/1 值,不得覆蓋)。"""
+        tx = _one_day_frame("2026-06-01", 45055.0)
+        sj = pd.concat([_one_day_frame("2026-06-01", 44000.0),
+                        _one_day_frame("2026-06-02", 44900.0)]).sort_index()
+        notes: list[str] = []
+        with (
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=tx),
+            patch("src.data.shioaji_fetcher.fetch_via_env", return_value=sj),
+        ):
+            out = _fetch_and_aggregate(date(2026, 6, 1), date(2026, 6, 2),
+                                       notify_fn=notes.append)
+        assert out is not None and len(out) == 2
+        assert float(out.loc[pd.Timestamp("2026-06-01"), "close"]) == 45055.0
+        assert float(out.loc[pd.Timestamp("2026-06-02"), "close"]) == 44900.0
+        assert any("退回 Shioaji" in m and "2026-06-02" in m for m in notes)
+
+    def test_no_creds_needed_when_taifex_complete(self):
+        """TAIFEX 齊全時 Shioaji creds 缺失無影響 (回補不再依賴 creds)。"""
+        d = date(2026, 6, 2)
+        with (
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=_one_day_frame("2026-06-02", 45055.0)),
+            patch("src.data.shioaji_fetcher.fetch_via_env",
+                  side_effect=RuntimeError("creds missing")) as mock_sj,
+        ):
+            out = _fetch_and_aggregate(d, d)
+        assert out is not None and float(out["close"].iloc[-1]) == 45055.0
+        mock_sj.assert_not_called()
 
     def test_both_empty_returns_none(self):
         d = date(2026, 6, 1)
         with (
-            patch("src.data.shioaji_fetcher.fetch_via_env",
-                  return_value=pd.DataFrame()),
             patch("src.data.validation.fetch_taifex_day_session_range",
                   return_value=None),
+            patch("src.data.shioaji_fetcher.fetch_via_env",
+                  return_value=pd.DataFrame()),
         ):
             out = _fetch_and_aggregate(d, d)
         assert out is None
@@ -574,15 +602,20 @@ class TestShioajiFetchEndDate:
         yesterday+1 (today). yesterday=2026-04-08."""
         from src.data import daily_updater as du
 
+        # 13:05 (非 13:00): UTC 編碼下 naive 誤讀 = 05:05 非法 → 語義可判。
+        # TAIFEX patch 成 None: TAIFEX-primary (2026-08-08) 下強制走 Shioaji
+        # fallback 路徑 (本測試的標的),同時保持 hermetic。
         FakeAdapter, captured = self._fake_adapter_module(
             self._make_kbars(
-                ["2026-04-08 13:00:00"], [21000.0],
+                ["2026-04-08 13:05:00"], [21000.0],
             )
         )
         with (
             patch.dict("os.environ", {
                 "SHIOAJI_API_KEY": "k", "SHIOAJI_SECRET_KEY": "s",
             }, clear=False),
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=None),
             patch("tw_futures.executor.shioaji_adapter.ShioajiAdapter",
                   FakeAdapter),
         ):
@@ -604,9 +637,9 @@ class TestShioajiFetchEndDate:
             self._make_kbars(
                 [
                     "2026-04-08 09:00:00",  # yesterday day-session open
-                    "2026-04-08 13:00:00",  # yesterday day-session close
+                    "2026-04-08 13:05:00",  # yesterday day-session close (可判定)
                     "2026-04-09 09:00:00",  # TODAY -- must be dropped
-                    "2026-04-09 13:00:00",
+                    "2026-04-09 13:05:00",
                 ],
                 [21000.0, 21100.0, 19800.0, 19850.0],
             )
@@ -615,6 +648,8 @@ class TestShioajiFetchEndDate:
             patch.dict("os.environ", {
                 "SHIOAJI_API_KEY": "k", "SHIOAJI_SECRET_KEY": "s",
             }, clear=False),
+            patch("src.data.validation.fetch_taifex_day_session_range",
+                  return_value=None),
             patch("tw_futures.executor.shioaji_adapter.ShioajiAdapter",
                   FakeAdapter),
         ):

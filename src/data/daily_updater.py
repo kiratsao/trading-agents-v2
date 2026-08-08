@@ -668,59 +668,93 @@ def _fetch_and_aggregate(
 ) -> pd.DataFrame | None:
     """Fetch daily day-session OHLCV over [start, end] INCLUSIVE.
 
-    Primary source is the single authoritative Shioaji fetcher in
-    ``src.data.shioaji_fetcher`` (all day-session filtering / aggregation /
-    settlement-exclusion lives there). When Shioaji yields NO day-session data
-    — empty *or* an exception (e.g. 2026-06-01: Shioaji returned 839 night-only
-    bars, 0 day-session; TAIFEX had the normal 45,055 day close) — fall back to
-    TAIFEX's official daily download so the parquet does not stall.
+    **TAIFEX 一般 is the PRIMARY source** (2026-08-08 裁示). The updater only
+    ever writes COMPLETED past days, and TAIFEX's official daily file is the
+    canonical truth for those; Shioaji is reserved for the live today-bar
+    (orchestrator path) after the 2026-07-25 kbars timestamp-semantics
+    incident (CLAUDE.md hard rule: 歷史回補一律 TAIFEX 一般). Bonus: backfills
+    no longer require Shioaji credentials.
 
-    ``notify_fn`` (optional) receives a LINE alert when the TAIFEX fallback is
-    used. The alert MUST state that the bar came from TAIFEX and has no
-    independent cross-validation: the cross-source validator's TAIFEX oracle
-    would then be comparing TAIFEX-against-TAIFEX (circular → trivially "ok").
+    Shioaji remains the FALLBACK for trading days the TAIFEX download misses
+    (transient network failure). Interaction contract — the two sources never
+    fight, TAIFEX always wins end-state:
+
+    * ``_calendar_guard`` still requires a TAIFEX 一般 row for every written
+      date, so a day TAIFEX truly does not have never reaches the parquet
+      regardless of what this function returns.
+    * A Shioaji-fallback bar is cross-validated downstream (update() 5b): the
+      TAIFEX oracle is then INDEPENDENT of the source, and the rescue path
+      substitutes the TAIFEX day value on divergence.
+    * A TAIFEX-primary bar never trips ``_night_provenance`` (its close ==
+      一般 by construction, so the ≠一般 condition fails); the relative spot
+      band and provenance stay live as anomaly nets. The TAIFEX oracle inside
+      ``validate_latest_bar`` becomes trivially-agreeing (circular) — the
+      Shioaji oracle and spot provide the independent checks.
 
     Returns None when neither source has valid day-session data.
     """
-    from src.data.shioaji_fetcher import fetch_via_env
-
-    daily = None
-    try:
-        daily = fetch_via_env(start, end, product="MXF")
-    except Exception as exc:
-        logger.warning(
-            "daily_updater: Shioaji fetch raised (%s) — trying TAIFEX fallback", exc,
-        )
-
-    if daily is not None and not daily.empty:
-        return daily
-
-    # ── TAIFEX fallback (Shioaji empty/raised) ───────────────────────────────
-    logger.warning(
-        "daily_updater: Shioaji day-session empty for %s→%s — using TAIFEX fallback",
-        start, end,
-    )
     from src.data.validation import fetch_taifex_day_session_range
 
+    tx = None
     try:
         tx = fetch_taifex_day_session_range(start, end)
     except Exception as exc:
-        logger.error("daily_updater: TAIFEX fallback raised: %s", exc)
-        tx = None
-
-    if tx is None or tx.empty:
-        logger.info("daily_updater: both Shioaji and TAIFEX returned empty")
-        return None
-
-    rng = f"{start}" if start == end else f"{start}~{end}"
-    msg = (
-        f"⚠️ {rng} 日盤改用 TAIFEX 補（Shioaji 缺日盤）\n"
-        f"此 bar 來自 TAIFEX，無獨立交叉驗證"
+        logger.warning(
+            "daily_updater: TAIFEX primary raised (%s) — trying Shioaji fallback",
+            exc,
+        )
+    have: set[date] = (
+        {ts.date() for ts in pd.DatetimeIndex(tx.index).normalize()}
+        if tx is not None and not tx.empty else set()
     )
-    logger.warning("daily_updater: TAIFEX fallback filled %s (%d bars)", rng, len(tx))
-    if notify_fn is not None:
-        notify_fn(msg)
-    return tx
+
+    from src.data.tw_holidays import is_trading_day
+
+    missing: list[date] = []
+    d = start
+    while d <= end:
+        if is_trading_day(d) and d not in have:
+            missing.append(d)
+        d += timedelta(days=1)
+
+    if not missing:
+        return tx if have else None
+
+    # ── Shioaji fallback for trading days TAIFEX did not return ─────────────
+    logger.warning(
+        "daily_updater: TAIFEX 缺 %s — 退回 Shioaji 日盤聚合",
+        [x.isoformat() for x in missing],
+    )
+    from src.data.shioaji_fetcher import fetch_via_env
+
+    sj = None
+    try:
+        sj = fetch_via_env(min(missing), max(missing), product="MXF")
+    except Exception as exc:
+        logger.warning("daily_updater: Shioaji fallback raised: %s", exc)
+
+    frames = [tx] if have else []
+    if sj is not None and not sj.empty:
+        miss_set = set(missing)
+        sj = sj[[ts.date() in miss_set
+                 for ts in pd.DatetimeIndex(sj.index).normalize()]]
+        if not sj.empty:
+            rng = ", ".join(str(pd.Timestamp(ts).date()) for ts in sj.index)
+            msg = (
+                f"⚠️ {rng} 日盤 TAIFEX 未取得，退回 Shioaji 聚合 — "
+                f"寫入前仍須通過 calendar guard (TAIFEX 確認交易日) 與交叉驗證"
+            )
+            logger.warning(msg)
+            if notify_fn is not None:
+                notify_fn(msg)
+            frames.append(sj)
+
+    if not frames:
+        logger.info("daily_updater: both TAIFEX and Shioaji returned empty")
+        return None
+    out = pd.concat(frames).sort_index()
+    out = out[~out.index.duplicated(keep="first")]
+    return out if not out.empty else None
 
 
 def update_all(
