@@ -636,7 +636,9 @@ class TestRegressionLadderCoversEquity:
         assert max(equities) >= 1_500_000, f"Ladder max {max(equities)} too low"
         # Extract max_contracts
         max_c = re.search(r"max_contracts:\s*(\d+)", content)
-        assert max_c and int(max_c.group(1)) >= 13, "max_contracts must be >= 13"
+        # 2026-08-05 裁示: max_contracts=3 (equity 1M 時 3口追繳距離 > 停損距離,
+        # 4口起追繳先於停損) — 下限守護改為防 0/typo,不再要求涵蓋滿枱 ladder。
+        assert max_c and int(max_c.group(1)) >= 3, "max_contracts must be >= 3"
 
 
 class TestRegressionStateBackup:
